@@ -3,6 +3,10 @@ set -euo pipefail
 
 KIND_VERSION='v0.31.0'
 KIND_RELEASES_LATEST_URL='https://github.com/kubernetes-sigs/kind/releases/latest'
+NVIDIA_DRA_DRIVER_RELEASE='nvidia-dra-driver-gpu'
+NVIDIA_DRA_DRIVER_NAMESPACE='nvidia-dra-driver-gpu'
+NVIDIA_DRA_DRIVER_CHART_VERSION="${MKCLUSTER_NVIDIA_DRA_DRIVER_CHART_VERSION:-25.12.0}"
+NVIDIA_DRA_DRIVER_ROOT="${MKCLUSTER_NVIDIA_DRA_DRIVER_ROOT:-/}"
 
 DEFAULT_CLUSTER_NAME=''
 DEFAULT_REGISTRY_NAME=''
@@ -10,6 +14,7 @@ DEFAULT_REGISTRY_PORT=''
 DEFAULT_WORKER_COUNT=''
 DEFAULT_IP_FAMILY=''
 DEFAULT_KUBERNETES_VERSION=''
+DEFAULT_PROVIDER=''
 DEFAULT_API_SERVER_ADDRESS=''
 DEFAULT_API_SERVER_PORT=''
 
@@ -21,14 +26,17 @@ gpu_enabled=false
 gpu_dra_enabled=false
 ip_family=''
 kubernetes_version=''
+provider=''
 kind_node_image=''
 api_server_address=''
 api_server_port=''
 container_cli=''
+gpu_mounts=()
 
 kind_extra_args=()
 kind_nodes=()
 feature_gates=()
+cluster_network_name=''
 
 if [[ -t 1 ]]; then
   color_reset=$'\033[0m'
@@ -153,6 +161,7 @@ function initialize_defaults() {
   DEFAULT_WORKER_COUNT="${MKCLUSTER_WORKER_COUNT:-3}"
   DEFAULT_IP_FAMILY="${MKCLUSTER_IP_FAMILY:-ipv4}"
   DEFAULT_KUBERNETES_VERSION='latest'
+  DEFAULT_PROVIDER="${KIND_EXPERIMENTAL_PROVIDER:-docker}"
   DEFAULT_API_SERVER_ADDRESS="$(detect_default_api_server_address)"
   DEFAULT_API_SERVER_PORT="${MKCLUSTER_API_SERVER_PORT:-6443}"
 
@@ -164,6 +173,7 @@ function initialize_defaults() {
   gpu_dra_enabled=false
   ip_family="${DEFAULT_IP_FAMILY}"
   kubernetes_version="${DEFAULT_KUBERNETES_VERSION}"
+  provider="${DEFAULT_PROVIDER}"
   api_server_address="${DEFAULT_API_SERVER_ADDRESS}"
   api_server_port="${DEFAULT_API_SERVER_PORT}"
 }
@@ -180,11 +190,12 @@ ${color_section}Usage${color_reset}
 ${color_example}Pass extra ${color_label}kind create cluster${color_example} arguments only after ${color_label}--${color_example}.${color_reset}
 
 ${color_section}Options${color_reset}
-  ${color_label}-g${color_comma},${color_reset} ${color_label}--gpu${color_reset}                      Label all worker nodes with ${color_literal}gpu=true${color_reset} ${color_meta}(${color_reset}${color_value_meta}disabled${color_reset}${color_meta})${color_reset}
-  ${color_label}-d${color_comma},${color_reset} ${color_label}--gpu-dra${color_reset}                  Enable experimental GPU DRA gates and ${color_literal}gpu=true${color_reset}
+  ${color_label}-g${color_comma},${color_reset} ${color_label}--gpu${color_reset}                      Install the NVIDIA DRA driver and label all worker nodes with ${color_literal}gpu=true${color_reset} ${color_meta}(${color_reset}${color_value_meta}disabled${color_reset}${color_meta})${color_reset}
+  ${color_label}-d${color_comma},${color_reset} ${color_label}--gpu-dra${color_reset}                  Install the NVIDIA DRA driver, enable experimental GPU DRA gates, and set ${color_literal}gpu=true${color_reset}
   ${color_label}-n${color_comma},${color_reset} ${color_label}--name${color_reset} ${color_meta}NAME${color_reset}                Set the cluster name ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_CLUSTER_NAME}${color_reset}${color_meta})${color_reset}
   ${color_label}-i${color_comma},${color_reset} ${color_label}--ip-family${color_reset} ${color_meta}FAMILY${color_reset}         Set the kind networking ${color_literal}ipFamily${color_reset} ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_IP_FAMILY}${color_reset}${color_meta})${color_reset}
   ${color_label}-k${color_comma},${color_reset} ${color_label}--kubernetes-version${color_reset} ${color_meta}VERSION${color_reset} Set the Kubernetes version to deploy ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_KUBERNETES_VERSION}${color_reset}${color_meta})${color_reset}
+  ${color_label}-P${color_comma},${color_reset} ${color_label}--provider${color_reset} ${color_meta}PROVIDER${color_reset}        Set the container provider ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_PROVIDER}${color_reset}${color_meta})${color_reset}
   ${color_label}-a${color_comma},${color_reset} ${color_label}--api-server-address${color_reset} ${color_meta}IP${color_reset}    Bind the Kubernetes API server to a host IP ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_API_SERVER_ADDRESS}${color_reset}${color_meta})${color_reset}
   ${color_label}-p${color_comma},${color_reset} ${color_label}--api-server-port${color_reset} ${color_meta}PORT${color_reset}     Publish the API server on a fixed host port ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_API_SERVER_PORT}${color_reset}${color_meta})${color_reset}
   ${color_label}-W${color_comma},${color_reset} ${color_label}--workers${color_reset} ${color_meta}COUNT${color_reset}            Set the worker node count ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_WORKER_COUNT}${color_reset}${color_meta})${color_reset}
@@ -199,6 +210,7 @@ ${color_section}Examples${color_reset}
   ${color_example}mkcluster -g${color_reset}
   ${color_example}mkcluster -d${color_reset}
   ${color_example}mkcluster -k 1.34${color_reset}
+  ${color_example}mkcluster -P nerdctl${color_reset}
   ${color_example}mkcluster --feature-gate MemoryQoS=true${color_reset}
   ${color_example}mkcluster -n dev --retain${color_reset}
   ${color_example}HOST_IP=192.0.2.10 mkcluster -n dev -i dual -a "\$HOST_IP" -p 6443 --wait 5m${color_reset}
@@ -246,7 +258,7 @@ function normalize_feature_gate() {
   fi
 
   [[ -n "${name}" ]] || die "Feature gate name cannot be empty"
-  printf '"%s": %s\n' "${name}" "${value}"
+  printf '"%s": %s' "${name}" "${value}"
 }
 
 function feature_gate_name() {
@@ -342,6 +354,15 @@ function parse_args() {
         ip_family="${1#*=}"
         shift
         ;;
+      -P|--provider)
+        require_arg "$1" "${2:-}"
+        provider="$2"
+        shift 2
+        ;;
+      --provider=*)
+        provider="${1#*=}"
+        shift
+        ;;
       -k|--kubernetes-version)
         require_arg "$1" "${2:-}"
         kubernetes_version="$2"
@@ -423,6 +444,10 @@ function validate_args() {
     ipv4|ipv6|dual) ;;
     *) die "ip family must be one of: ipv4, ipv6, dual" ;;
   esac
+  case "${provider}" in
+    docker|nerdctl|podman) ;;
+    *) die "provider must be one of: docker, nerdctl, podman" ;;
+  esac
   kind_node_image="$(resolve_kind_node_image "${kubernetes_version}")"
 
   if [[ "${gpu_dra_enabled}" == true ]]; then
@@ -457,37 +482,8 @@ function detect_container_cli() {
     return
   fi
 
-  if [[ -n "${KIND_EXPERIMENTAL_PROVIDER:-}" ]]; then
-    case "${KIND_EXPERIMENTAL_PROVIDER}" in
-      docker|nerdctl|podman)
-        echo "${KIND_EXPERIMENTAL_PROVIDER}"
-        return
-        ;;
-      *)
-        die "Unsupported KIND_EXPERIMENTAL_PROVIDER: ${KIND_EXPERIMENTAL_PROVIDER}"
-        ;;
-    esac
-  fi
-
-  local providers=()
-  command -v docker &>/dev/null && providers+=("docker")
-  command -v podman &>/dev/null && providers+=("podman")
-  command -v nerdctl &>/dev/null && providers+=("nerdctl")
-
-  if (( ${#providers[@]} == 0 )); then
-    die "No supported container CLI found (docker, podman, or nerdctl)."
-  fi
-
-  if (( ${#providers[@]} > 1 )); then
-    cat >&2 <<EOF
-Multiple container CLIs detected: ${providers[*]}
-Set KIND_EXPERIMENTAL_PROVIDER to one of: docker, podman, nerdctl.
-Example: KIND_EXPERIMENTAL_PROVIDER=docker mkcluster
-EOF
-    exit 1
-  fi
-
-  echo "${providers[0]}"
+  command -v "${provider}" &>/dev/null || die "Selected provider '${provider}' is not installed or not on PATH."
+  echo "${provider}"
 }
 
 function linux_preflight() {
@@ -604,6 +600,62 @@ function require_gpu_host_prereqs() {
     die "${runtime_config} must set accept-nvidia-visible-devices-as-volume-mounts = true for this kind GPU workflow."
 }
 
+function append_gpu_mount() {
+  local host_path="$1"
+  local container_path="$2"
+
+  gpu_mounts+=("${host_path}|${container_path}")
+}
+
+function append_gpu_mount_if_present() {
+  local host_path="$1"
+  local container_path="$2"
+
+  [[ -n "${host_path}" && -e "${host_path}" ]] || return
+  append_gpu_mount "${host_path}" "${container_path}"
+}
+
+function detect_gpu_node_library_dir() {
+  case "$(uname -m)" in
+    x86_64|amd64)
+      printf '%s\n' '/usr/lib/x86_64-linux-gnu'
+      ;;
+    aarch64|arm64)
+      printf '%s\n' '/usr/lib/aarch64-linux-gnu'
+      ;;
+    *)
+      printf '%s\n' '/usr/lib64'
+      ;;
+  esac
+}
+
+function detect_gpu_mounts() {
+  gpu_mounts=()
+
+  local nvidia_smi_path
+  local libnvidia_ml_soname_path libnvidia_ml_real_path
+  local libcuda_soname_path libcuda_real_path
+  local ldconfig_output
+  local node_library_dir
+  nvidia_smi_path="$(readlink -f "$(command -v nvidia-smi)")"
+  ldconfig_output="$(ldconfig -p 2>/dev/null || true)"
+  libnvidia_ml_soname_path="$(awk '/libnvidia-ml\.so\.1 \(libc6,x86-64\)/ {print $NF; exit}' <<<"${ldconfig_output}")"
+  libcuda_soname_path="$(awk '/libcuda\.so\.1 \(libc6,x86-64\)/ {print $NF; exit}' <<<"${ldconfig_output}")"
+  [[ -n "${libnvidia_ml_soname_path}" ]] && libnvidia_ml_real_path="$(readlink -f "${libnvidia_ml_soname_path}")"
+  [[ -n "${libcuda_soname_path}" ]] && libcuda_real_path="$(readlink -f "${libcuda_soname_path}")"
+  node_library_dir="$(detect_gpu_node_library_dir)"
+
+  [[ -n "${nvidia_smi_path}" && -f "${nvidia_smi_path}" ]] || die "Could not resolve the host path for nvidia-smi."
+  [[ -n "${libnvidia_ml_soname_path}" && -e "${libnvidia_ml_soname_path}" ]] || die "Could not resolve the host path for libnvidia-ml.so.1."
+  [[ -n "${libcuda_soname_path}" && -e "${libcuda_soname_path}" ]] || die "Could not resolve the host path for libcuda.so.1."
+
+  append_gpu_mount "${nvidia_smi_path}" "/usr/bin/nvidia-smi"
+  append_gpu_mount "${libnvidia_ml_soname_path}" "${node_library_dir}/libnvidia-ml.so.1"
+  append_gpu_mount_if_present "${libnvidia_ml_real_path}" "${node_library_dir}/$(basename "${libnvidia_ml_real_path}")"
+  append_gpu_mount "${libcuda_soname_path}" "${node_library_dir}/libcuda.so.1"
+  append_gpu_mount_if_present "${libcuda_real_path}" "${node_library_dir}/$(basename "${libcuda_real_path}")"
+}
+
 function require_gpu_provider_prereqs() {
   case "${container_cli}" in
     docker)
@@ -626,6 +678,14 @@ function require_gpu_provider_prereqs() {
   esac
 }
 
+function require_dra_prereqs() {
+  if [[ "${gpu_enabled}" != true ]]; then
+    return
+  fi
+
+  command -v helm &>/dev/null || die "GPU DRA mode requires helm on the host."
+}
+
 function gpu_preflight() {
   if [[ "${gpu_enabled}" != true ]]; then
     return
@@ -633,6 +693,8 @@ function gpu_preflight() {
 
   require_gpu_host_prereqs
   require_gpu_provider_prereqs
+  require_dra_prereqs
+  detect_gpu_mounts
 }
 
 function ensure_podman_kind_network() {
@@ -687,7 +749,7 @@ EOF
     echo "featureGates:"
     local gate
     for gate in "${feature_gates[@]}"; do
-      printf '  %s' "$(normalize_feature_gate "${gate}")"
+      printf '  %s\n' "$(normalize_feature_gate "${gate}")"
     done
   fi
 
@@ -710,6 +772,7 @@ nodes:
         hostPort: 443
 EOF
 
+  local gpu_mount host_path container_path
   local worker_index
   for ((worker_index = 0; worker_index < worker_count; worker_index++)); do
     echo "  - role: worker"
@@ -717,7 +780,22 @@ EOF
       cat <<EOF
     labels:
       gpu: "true"
+      nvidia.com/gpu.present: "true"
+      nvidia.com/dra-kubelet-plugin: "true"
 EOF
+      cat <<EOF
+    extraMounts:
+EOF
+      for gpu_mount in "${gpu_mounts[@]}"; do
+        IFS='|' read -r host_path container_path <<<"${gpu_mount}"
+        cat <<EOF
+      - hostPath: ${host_path}
+        containerPath: ${container_path}
+        readOnly: true
+        selinuxRelabel: false
+        propagation: None
+EOF
+      done
     fi
   done
 }
@@ -737,9 +815,22 @@ function load_kind_nodes() {
   (( ${#kind_nodes[@]} > 0 )) || die "No nodes found for cluster ${cluster_name}"
 }
 
+function detect_cluster_network_name() {
+  local first_node="${kind_nodes[0]}"
+  local network_name=''
+
+  # shellcheck disable=SC2016
+  network_name="$("${container_cli}" inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "${first_node}" 2>/dev/null | head -n1)"
+  [[ -n "${network_name}" ]] || die "Could not determine the container network for node ${first_node}"
+
+  printf '%s\n' "${network_name}"
+}
+
 function connect_registry_network() {
-  if [ "$("${container_cli}" inspect -f="{{json (index .NetworkSettings.Networks \"${cluster_name}\")}}" "${registry_name}")" = 'null' ]; then
-    "${container_cli}" network connect "${cluster_name}" "${registry_name}"
+  cluster_network_name="$(detect_cluster_network_name)"
+
+  if [ "$("${container_cli}" inspect -f="{{json (index .NetworkSettings.Networks \"${cluster_network_name}\")}}" "${registry_name}" 2>/dev/null || true)" = 'null' ]; then
+    "${container_cli}" network connect "${cluster_network_name}" "${registry_name}"
   fi
 }
 
@@ -777,6 +868,35 @@ data:
 EOF
 }
 
+function install_nvidia_dra_driver() {
+  if [[ "${gpu_enabled}" != true ]]; then
+    return
+  fi
+
+  local values_file
+  values_file="$(mktemp)"
+  cat >"${values_file}" <<EOF
+image:
+  pullPolicy: IfNotPresent
+kubeletPlugin:
+  nodeSelector:
+    nvidia.com/dra-kubelet-plugin: "true"
+EOF
+
+  info "Installing NVIDIA DRA driver via Helm..."
+  helm repo add nvidia https://helm.ngc.nvidia.com/nvidia >/dev/null 2>&1 || true
+  helm repo update || die "Failed to update the NVIDIA Helm repository."
+  helm upgrade -i "${NVIDIA_DRA_DRIVER_RELEASE}" nvidia/nvidia-dra-driver-gpu \
+    --version "${NVIDIA_DRA_DRIVER_CHART_VERSION}" \
+    --namespace "${NVIDIA_DRA_DRIVER_NAMESPACE}" \
+    --create-namespace \
+    --set gpuResourcesEnabledOverride=true \
+    --set nvidiaDriverRoot="${NVIDIA_DRA_DRIVER_ROOT}" \
+    -f "${values_file}" ||
+    die "Failed to install the NVIDIA DRA driver Helm chart."
+  rm -f "${values_file}"
+}
+
 initialize_defaults
 parse_args "$@"
 validate_args
@@ -792,5 +912,6 @@ connect_registry_network
 configure_registry_for_nodes
 annotate_registry
 document_local_registry
+install_nvidia_dra_driver
 
 info "Cluster ${cluster_name} is ready."

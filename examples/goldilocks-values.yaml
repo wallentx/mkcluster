@@ -1,0 +1,44 @@
+# Cluster-wide Goldilocks profile for a cluster that already has VPA installed.
+#
+# This enables the controller and dashboard and makes the controller manage
+# namespaces by default. Namespace labels still take precedence over these flags.
+
+vpa:
+  enabled: false
+
+metrics-server:
+  enabled: false
+
+image:
+  tag: v4.14.18
+
+controller:
+  enabled: true
+  flags:
+    on-by-default: true
+  rbac:
+    extraRules:
+      - apiGroups:
+          - monitoring.coreos.com
+        resources:
+          - alertmanagers
+          - prometheuses
+          - prometheusagents
+          - thanosrulers
+        verbs:
+          - get
+          - list
+          - watch
+  resources:
+    requests:
+      cpu: 25m
+      memory: 256Mi
+
+dashboard:
+  enabled: true
+  flags:
+    on-by-default: true
+  resources:
+    requests:
+      cpu: 25m
+      memory: 256Mi
