@@ -1,0 +1,796 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+KIND_VERSION='v0.31.0'
+KIND_RELEASES_LATEST_URL='https://github.com/kubernetes-sigs/kind/releases/latest'
+
+DEFAULT_CLUSTER_NAME=''
+DEFAULT_REGISTRY_NAME=''
+DEFAULT_REGISTRY_PORT=''
+DEFAULT_WORKER_COUNT=''
+DEFAULT_IP_FAMILY=''
+DEFAULT_KUBERNETES_VERSION=''
+DEFAULT_API_SERVER_ADDRESS=''
+DEFAULT_API_SERVER_PORT=''
+
+cluster_name=''
+registry_name=''
+registry_port=''
+worker_count=''
+gpu_enabled=false
+gpu_dra_enabled=false
+ip_family=''
+kubernetes_version=''
+kind_node_image=''
+api_server_address=''
+api_server_port=''
+container_cli=''
+
+kind_extra_args=()
+kind_nodes=()
+feature_gates=()
+
+if [[ -t 1 ]]; then
+  color_reset=$'\033[0m'
+  color_heading=$'\033[1;96m'
+  color_section=$'\033[1;94m'
+  color_label=$'\033[1;95m'
+  color_meta=$'\033[3;90m'
+  color_value_meta=$'\033[3;31m'
+  color_example=$'\033[3;90m'
+  color_literal=$'\033[1;33m'
+  color_comma=$'\033[0;37m'
+  color_bracket=$'\033[1;32m'
+  color_bracket_text=$'\033[3;94m'
+  color_green=$'\033[32m'
+  color_yellow=$'\033[33m'
+  color_red=$'\033[31m'
+else
+  color_reset=''
+  color_heading=''
+  color_section=''
+  color_label=''
+  color_meta=''
+  color_value_meta=''
+  color_example=''
+  color_literal=''
+  color_comma=''
+  color_bracket=''
+  color_bracket_text=''
+  color_green=''
+  color_yellow=''
+  color_red=''
+fi
+
+function info() {
+  printf '%s%s%s\n' "${color_green}" "$*" "${color_reset}"
+}
+
+function warn() {
+  printf '%s%s%s\n' "${color_yellow}" "$*" "${color_reset}" >&2
+}
+
+function die() {
+  printf '%s%s%s\n' "${color_red}" "$*" "${color_reset}" >&2
+  exit 1
+}
+
+function detect_linux_host_ip() {
+  local host_ip=''
+
+  if command -v ip &>/dev/null; then
+    host_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')"
+  fi
+
+  if [[ -z "${host_ip}" ]] && command -v hostname &>/dev/null; then
+    host_ip="$(hostname -i 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^127\./) {print $i; exit}}')"
+  fi
+
+  if [[ -z "${host_ip}" ]] && command -v hostname &>/dev/null; then
+    host_ip="$(hostname -i 2>/dev/null | awk '{print $1}')"
+  fi
+
+  [[ -n "${host_ip}" ]] || return 1
+  printf '%s\n' "${host_ip}"
+}
+
+function detect_darwin_host_ip() {
+  command -v route &>/dev/null || return 1
+
+  local default_interface host_ip
+  default_interface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  [[ -n "${default_interface}" ]] || return 1
+
+  if command -v ipconfig &>/dev/null; then
+    host_ip="$(ipconfig getifaddr "${default_interface}" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "${host_ip}" ]] && command -v ifconfig &>/dev/null; then
+    host_ip="$(ifconfig "${default_interface}" 2>/dev/null | awk '/inet / {print $2; exit}')"
+  fi
+
+  [[ -n "${host_ip}" ]] || return 1
+  printf '%s\n' "${host_ip}"
+}
+
+function detect_default_api_server_address() {
+  if [[ -n "${MKCLUSTER_API_SERVER_ADDRESS:-}" ]]; then
+    printf '%s\n' "${MKCLUSTER_API_SERVER_ADDRESS}"
+    return
+  fi
+
+  local host_ip=''
+  case "${OSTYPE}" in
+    linux*)
+      host_ip="$(detect_linux_host_ip || true)"
+      ;;
+    darwin*)
+      host_ip="$(detect_darwin_host_ip || true)"
+      ;;
+  esac
+
+  printf '%s\n' "${host_ip:-127.0.0.1}"
+}
+
+function detect_default_cluster_name() {
+  if [[ -n "${KIND_CLUSTER_NAME:-}" ]]; then
+    printf '%s\n' "${KIND_CLUSTER_NAME}"
+    return
+  fi
+
+  local host_name=''
+  if command -v hostname &>/dev/null; then
+    host_name="$(hostname 2>/dev/null || true)"
+  fi
+
+  printf '%s\n' "${host_name:-kind}"
+}
+
+function initialize_defaults() {
+  DEFAULT_CLUSTER_NAME="$(detect_default_cluster_name)"
+  DEFAULT_REGISTRY_NAME="${MKCLUSTER_REGISTRY_NAME:-kind-registry}"
+  DEFAULT_REGISTRY_PORT="${MKCLUSTER_REGISTRY_PORT:-5001}"
+  DEFAULT_WORKER_COUNT="${MKCLUSTER_WORKER_COUNT:-3}"
+  DEFAULT_IP_FAMILY="${MKCLUSTER_IP_FAMILY:-ipv4}"
+  DEFAULT_KUBERNETES_VERSION='latest'
+  DEFAULT_API_SERVER_ADDRESS="$(detect_default_api_server_address)"
+  DEFAULT_API_SERVER_PORT="${MKCLUSTER_API_SERVER_PORT:-6443}"
+
+  cluster_name="${DEFAULT_CLUSTER_NAME}"
+  registry_name="${DEFAULT_REGISTRY_NAME}"
+  registry_port="${DEFAULT_REGISTRY_PORT}"
+  worker_count="${DEFAULT_WORKER_COUNT}"
+  gpu_enabled=false
+  gpu_dra_enabled=false
+  ip_family="${DEFAULT_IP_FAMILY}"
+  kubernetes_version="${DEFAULT_KUBERNETES_VERSION}"
+  api_server_address="${DEFAULT_API_SERVER_ADDRESS}"
+  api_server_port="${DEFAULT_API_SERVER_PORT}"
+}
+
+function usage() {
+  cat <<EOF
+${color_heading}mkcluster${color_reset}
+${color_example}Create a local kind cluster with an attached local registry and a small wrapper${color_reset}
+${color_example}around the more useful kind knobs.${color_reset}
+
+${color_section}Usage${color_reset}
+  ${color_label}mkcluster${color_reset} ${color_bracket}[${color_reset}${color_bracket_text}options${color_reset}${color_bracket}]${color_reset} ${color_bracket}[${color_reset}${color_bracket_text}kind create cluster args...${color_reset}${color_bracket}]${color_reset}
+
+${color_example}Pass extra ${color_label}kind create cluster${color_example} arguments only after ${color_label}--${color_example}.${color_reset}
+
+${color_section}Options${color_reset}
+  ${color_label}-g${color_comma},${color_reset} ${color_label}--gpu${color_reset}                      Label all worker nodes with ${color_literal}gpu=true${color_reset} ${color_meta}(${color_reset}${color_value_meta}disabled${color_reset}${color_meta})${color_reset}
+  ${color_label}-d${color_comma},${color_reset} ${color_label}--gpu-dra${color_reset}                  Enable experimental GPU DRA gates and ${color_literal}gpu=true${color_reset}
+  ${color_label}-n${color_comma},${color_reset} ${color_label}--name${color_reset} ${color_meta}NAME${color_reset}                Set the cluster name ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_CLUSTER_NAME}${color_reset}${color_meta})${color_reset}
+  ${color_label}-i${color_comma},${color_reset} ${color_label}--ip-family${color_reset} ${color_meta}FAMILY${color_reset}         Set the kind networking ${color_literal}ipFamily${color_reset} ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_IP_FAMILY}${color_reset}${color_meta})${color_reset}
+  ${color_label}-k${color_comma},${color_reset} ${color_label}--kubernetes-version${color_reset} ${color_meta}VERSION${color_reset} Set the Kubernetes version to deploy ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_KUBERNETES_VERSION}${color_reset}${color_meta})${color_reset}
+  ${color_label}-a${color_comma},${color_reset} ${color_label}--api-server-address${color_reset} ${color_meta}IP${color_reset}    Bind the Kubernetes API server to a host IP ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_API_SERVER_ADDRESS}${color_reset}${color_meta})${color_reset}
+  ${color_label}-p${color_comma},${color_reset} ${color_label}--api-server-port${color_reset} ${color_meta}PORT${color_reset}     Publish the API server on a fixed host port ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_API_SERVER_PORT}${color_reset}${color_meta})${color_reset}
+  ${color_label}-W${color_comma},${color_reset} ${color_label}--workers${color_reset} ${color_meta}COUNT${color_reset}            Set the worker node count ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_WORKER_COUNT}${color_reset}${color_meta})${color_reset}
+  ${color_label}-f${color_comma},${color_reset} ${color_label}--feature-gate${color_reset} ${color_meta}GATE${color_reset}${color_bracket}[${color_reset}${color_bracket_text}=BOOL${color_reset}${color_bracket}]${color_reset} Enable or disable a Kubernetes feature gate
+  ${color_label}-l${color_comma},${color_reset} ${color_label}--latest-kind-version${color_reset}      Print the latest kind release tag and exit
+  ${color_label}-r${color_comma},${color_reset} ${color_label}--retain${color_reset}                   Retain nodes when cluster creation fails
+  ${color_label}-w${color_comma},${color_reset} ${color_label}--wait${color_reset} ${color_meta}DURATION${color_reset}            Wait for cluster readiness, e.g. ${color_literal}5m${color_reset}
+  ${color_label}-h${color_comma},${color_reset} ${color_label}--help${color_reset}                     Show this help
+
+${color_section}Examples${color_reset}
+  ${color_example}mkcluster${color_reset}
+  ${color_example}mkcluster -g${color_reset}
+  ${color_example}mkcluster -d${color_reset}
+  ${color_example}mkcluster -k 1.34${color_reset}
+  ${color_example}mkcluster --feature-gate MemoryQoS=true${color_reset}
+  ${color_example}mkcluster -n dev --retain${color_reset}
+  ${color_example}HOST_IP=192.0.2.10 mkcluster -n dev -i dual -a "\$HOST_IP" -p 6443 --wait 5m${color_reset}
+  ${color_example}mkcluster -- --verbosity=4${color_reset}
+EOF
+}
+
+function require_arg() {
+  local flag="$1"
+  local value="${2:-}"
+
+  [[ -n "${value}" ]] || die "Missing value for ${flag}"
+}
+
+function is_true() {
+  case "${1,,}" in
+    1|true|yes|on) return 0 ;;
+    0|false|no|off) return 1 ;;
+    *) die "Expected a boolean value, got: ${1}" ;;
+  esac
+}
+
+function validate_positive_int() {
+  local name="$1"
+  local value="$2"
+
+  [[ "${value}" =~ ^[1-9][0-9]*$ ]] || die "${name} must be a positive integer, got: ${value}"
+}
+
+function normalize_feature_gate() {
+  local raw="$1"
+  local name value
+
+  if [[ "${raw}" == *=* ]]; then
+    name="${raw%%=*}"
+    value="${raw#*=}"
+    if is_true "${value}"; then
+      value=true
+    else
+      value=false
+    fi
+  else
+    name="${raw}"
+    value=true
+  fi
+
+  [[ -n "${name}" ]] || die "Feature gate name cannot be empty"
+  printf '"%s": %s\n' "${name}" "${value}"
+}
+
+function feature_gate_name() {
+  local raw="$1"
+  printf '%s\n' "${raw%%=*}"
+}
+
+function ensure_feature_gate_default() {
+  local desired_gate="$1"
+  local existing_gate
+
+  for existing_gate in "${feature_gates[@]}"; do
+    if [[ "$(feature_gate_name "${existing_gate}")" == "${desired_gate}" ]]; then
+      return
+    fi
+  done
+
+  feature_gates+=("${desired_gate}=true")
+}
+
+function print_latest_kind_version() {
+  command -v curl &>/dev/null || die "curl is required for --latest-kind-version"
+
+  local latest_url
+  latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}\n' "${KIND_RELEASES_LATEST_URL}")" ||
+    die "Failed to retrieve the latest kind release tag from ${KIND_RELEASES_LATEST_URL}"
+
+  printf '%s\n' "${latest_url##*/}"
+}
+
+function resolve_kind_node_image() {
+  local version="${1#v}"
+
+  case "${version}" in
+    latest)
+      printf '%s\n' ''
+      ;;
+    1.35|1.35.0)
+      printf '%s\n' 'kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f'
+      ;;
+    1.34|1.34.3)
+      printf '%s\n' 'kindest/node:v1.34.3@sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48'
+      ;;
+    1.33|1.33.7)
+      printf '%s\n' 'kindest/node:v1.33.7@sha256:d26ef333bdb2cbe9862a0f7c3803ecc7b4303d8cea8e814b481b09949d353040'
+      ;;
+    1.32|1.32.11)
+      printf '%s\n' 'kindest/node:v1.32.11@sha256:5fc52d52a7b9574015299724bd68f183702956aa4a2116ae75a63cb574b35af8'
+      ;;
+    1.31|1.31.14)
+      printf '%s\n' 'kindest/node:v1.31.14@sha256:6f86cf509dbb42767b6e79debc3f2c32e4ee01386f0489b3b2be24b0a55aac2b'
+      ;;
+    *)
+      die "Unsupported Kubernetes version: ${1}. Supported values: latest, 1.35, 1.34, 1.33, 1.32, 1.31"
+      ;;
+  esac
+}
+
+function parse_args() {
+  while (($#)); do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -l|--latest-kind-version)
+        print_latest_kind_version
+        exit 0
+        ;;
+      -g|--gpu)
+        gpu_enabled=true
+        shift
+        ;;
+      -d|--gpu-dra)
+        gpu_dra_enabled=true
+        shift
+        ;;
+      -n|--name)
+        require_arg "$1" "${2:-}"
+        cluster_name="$2"
+        shift 2
+        ;;
+      --name=*)
+        cluster_name="${1#*=}"
+        shift
+        ;;
+      -i|--ip-family)
+        require_arg "$1" "${2:-}"
+        ip_family="$2"
+        shift 2
+        ;;
+      --ip-family=*)
+        ip_family="${1#*=}"
+        shift
+        ;;
+      -k|--kubernetes-version)
+        require_arg "$1" "${2:-}"
+        kubernetes_version="$2"
+        shift 2
+        ;;
+      --kubernetes-version=*)
+        kubernetes_version="${1#*=}"
+        shift
+        ;;
+      -a|--api-server-address)
+        require_arg "$1" "${2:-}"
+        api_server_address="$2"
+        shift 2
+        ;;
+      --api-server-address=*)
+        api_server_address="${1#*=}"
+        shift
+        ;;
+      -p|--api-server-port)
+        require_arg "$1" "${2:-}"
+        api_server_port="$2"
+        shift 2
+        ;;
+      --api-server-port=*)
+        api_server_port="${1#*=}"
+        shift
+        ;;
+      -W|--workers)
+        require_arg "$1" "${2:-}"
+        worker_count="$2"
+        shift 2
+        ;;
+      --workers=*)
+        worker_count="${1#*=}"
+        shift
+        ;;
+      -f|--feature-gate)
+        require_arg "$1" "${2:-}"
+        feature_gates+=("$2")
+        shift 2
+        ;;
+      --feature-gate=*)
+        feature_gates+=("${1#*=}")
+        shift
+        ;;
+      -r|--retain)
+        kind_extra_args+=(--retain)
+        shift
+        ;;
+      -w|--wait)
+        require_arg "$1" "${2:-}"
+        kind_extra_args+=(--wait "$2")
+        shift 2
+        ;;
+      --wait=*)
+        kind_extra_args+=(--wait "${1#*=}")
+        shift
+        ;;
+      --)
+        shift
+        kind_extra_args+=("$@")
+        break
+        ;;
+      *)
+        die "Unknown argument: $1. Pass through extra kind arguments after --"
+        ;;
+    esac
+  done
+}
+
+function validate_args() {
+  [[ -n "${cluster_name}" ]] || die "Cluster name cannot be empty"
+  [[ -n "${registry_name}" ]] || die "Registry name cannot be empty"
+
+  validate_positive_int "worker count" "${worker_count}"
+  validate_positive_int "registry port" "${registry_port}"
+  validate_positive_int "api server port" "${api_server_port}"
+  case "${ip_family}" in
+    ipv4|ipv6|dual) ;;
+    *) die "ip family must be one of: ipv4, ipv6, dual" ;;
+  esac
+  kind_node_image="$(resolve_kind_node_image "${kubernetes_version}")"
+
+  if [[ "${gpu_dra_enabled}" == true ]]; then
+    gpu_enabled=true
+    ensure_feature_gate_default "DRAPartitionableDevices"
+    ensure_feature_gate_default "DRAConsumableCapacity"
+  fi
+
+  if ! is_true "${gpu_enabled}"; then
+    gpu_enabled=false
+  else
+    gpu_enabled=true
+  fi
+}
+
+function check_deps() {
+  if [[ $OSTYPE =~ ^darwin ]]; then
+    command -v kind &>/dev/null || brew install kind
+    command -v kubectl &>/dev/null || brew install kubectl
+  elif [[ $OSTYPE =~ ^linux ]]; then
+    command -v kind &>/dev/null || go install "sigs.k8s.io/kind@${KIND_VERSION}" || warn "Install kind from your package manager"
+    if ! command -v kubectl &>/dev/null; then
+      curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" &&
+      sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+    fi
+  fi
+}
+
+function detect_container_cli() {
+  if [[ -n "${CONTAINER_CLI:-}" ]]; then
+    echo "${CONTAINER_CLI}"
+    return
+  fi
+
+  if [[ -n "${KIND_EXPERIMENTAL_PROVIDER:-}" ]]; then
+    case "${KIND_EXPERIMENTAL_PROVIDER}" in
+      docker|nerdctl|podman)
+        echo "${KIND_EXPERIMENTAL_PROVIDER}"
+        return
+        ;;
+      *)
+        die "Unsupported KIND_EXPERIMENTAL_PROVIDER: ${KIND_EXPERIMENTAL_PROVIDER}"
+        ;;
+    esac
+  fi
+
+  local providers=()
+  command -v docker &>/dev/null && providers+=("docker")
+  command -v podman &>/dev/null && providers+=("podman")
+  command -v nerdctl &>/dev/null && providers+=("nerdctl")
+
+  if (( ${#providers[@]} == 0 )); then
+    die "No supported container CLI found (docker, podman, or nerdctl)."
+  fi
+
+  if (( ${#providers[@]} > 1 )); then
+    cat >&2 <<EOF
+Multiple container CLIs detected: ${providers[*]}
+Set KIND_EXPERIMENTAL_PROVIDER to one of: docker, podman, nerdctl.
+Example: KIND_EXPERIMENTAL_PROVIDER=docker mkcluster
+EOF
+    exit 1
+  fi
+
+  echo "${providers[0]}"
+}
+
+function linux_preflight() {
+  if [[ ! $OSTYPE =~ ^linux ]]; then
+    return
+  fi
+
+  local ip_forward
+  ip_forward="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
+  if [[ "${ip_forward}" != "1" ]]; then
+    cat >&2 <<EOF
+net.ipv4.ip_forward is ${ip_forward:-unset}. kind networking will fail until IP forwarding is enabled.
+Run:
+  sudo sysctl -w net.ipv4.ip_forward=1
+To persist:
+  echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-kind.conf
+EOF
+    exit 1
+  fi
+}
+
+function config_section_has_setting() {
+  local file_path="$1"
+  local section_name="$2"
+  local setting_name="$3"
+  local expected_value="$4"
+
+  [[ -f "${file_path}" ]] || return 1
+
+  awk \
+    -v section_name="${section_name}" \
+    -v setting_name="${setting_name}" \
+    -v expected_value="${expected_value}" '
+      function trim(value) {
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        return value
+      }
+
+      /^[[:space:]]*#/ { next }
+      /^[[:space:]]*;/ { next }
+      /^[[:space:]]*\[/ {
+        in_section = ($0 == "[" section_name "]")
+        next
+      }
+      !in_section { next }
+      $0 ~ "^[[:space:]]*" setting_name "[[:space:]]*=" {
+        split($0, parts, "=")
+        value = trim(parts[2])
+        gsub(/"/, "", value)
+        if (value == expected_value) {
+          found = 1
+          exit
+        }
+      }
+      END {
+        exit(found ? 0 : 1)
+      }
+    ' "${file_path}"
+}
+
+function config_root_has_setting() {
+  local file_path="$1"
+  local setting_name="$2"
+  local expected_value="$3"
+
+  [[ -f "${file_path}" ]] || return 1
+
+  awk \
+    -v setting_name="${setting_name}" \
+    -v expected_value="${expected_value}" '
+      function trim(value) {
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        return value
+      }
+
+      /^[[:space:]]*#/ { next }
+      /^[[:space:]]*;/ { next }
+      /^[[:space:]]*\[/ {
+        in_section = 1
+        next
+      }
+      in_section { next }
+      $0 ~ "^[[:space:]]*" setting_name "[[:space:]]*=" {
+        split($0, parts, "=")
+        value = trim(parts[2])
+        gsub(/"/, "", value)
+        if (value == expected_value) {
+          found = 1
+          exit
+        }
+      }
+      END {
+        exit(found ? 0 : 1)
+      }
+    ' "${file_path}"
+}
+
+function require_gpu_host_prereqs() {
+  [[ $OSTYPE =~ ^linux ]] || die "GPU clusters are only validated on Linux hosts."
+
+  command -v nvidia-smi &>/dev/null || die "GPU support requires nvidia-smi on the host."
+  nvidia-smi -L &>/dev/null || die "nvidia-smi could not enumerate any GPUs."
+  command -v nvidia-container-runtime &>/dev/null || die "GPU support requires nvidia-container-runtime on the host."
+
+  [[ -e /dev/nvidiactl ]] || die "GPU support requires /dev/nvidiactl on the host."
+  compgen -G '/dev/nvidia[0-9]*' >/dev/null || die "GPU support requires at least one /dev/nvidia<N> device on the host."
+
+  local runtime_config='/etc/nvidia-container-runtime/config.toml'
+  [[ -f "${runtime_config}" ]] || die "GPU support requires ${runtime_config}."
+
+  config_root_has_setting "${runtime_config}" "accept-nvidia-visible-devices-as-volume-mounts" "true" ||
+    die "${runtime_config} must set accept-nvidia-visible-devices-as-volume-mounts = true for this kind GPU workflow."
+}
+
+function require_gpu_provider_prereqs() {
+  case "${container_cli}" in
+    docker)
+      command -v docker &>/dev/null || die "GPU support with docker requires the docker CLI."
+      docker info &>/dev/null || die "docker info failed; the Docker daemon must be reachable for GPU clusters."
+      [[ "$(docker info --format '{{.DefaultRuntime}}' 2>/dev/null)" == "nvidia" ]] ||
+        die "Docker must use the nvidia default runtime for kind GPU nodes."
+      ;;
+    nerdctl)
+      local containerd_config='/etc/containerd/config.toml'
+      [[ -f "${containerd_config}" ]] || die "GPU support with nerdctl requires ${containerd_config}."
+      grep -Eq '^[[:space:]]*default_runtime_name[[:space:]]*=[[:space:]]*"nvidia"' "${containerd_config}" ||
+        die "${containerd_config} must set default_runtime_name = \"nvidia\" for kind GPU nodes."
+      grep -Eq '^[[:space:]]*BinaryName[[:space:]]*=[[:space:]]*"/usr/bin/nvidia-container-runtime"' "${containerd_config}" ||
+        die "${containerd_config} must configure the nvidia runtime BinaryName for kind GPU nodes."
+      ;;
+    podman)
+      die "GPU validation is only implemented for docker and nerdctl providers; podman is not supported for mkcluster GPU mode."
+      ;;
+  esac
+}
+
+function gpu_preflight() {
+  if [[ "${gpu_enabled}" != true ]]; then
+    return
+  fi
+
+  require_gpu_host_prereqs
+  require_gpu_provider_prereqs
+}
+
+function ensure_podman_kind_network() {
+  if [[ "${container_cli}" != "podman" ]]; then
+    return
+  fi
+
+  if [[ -e /proc/sys/net/ipv6/conf/all/forwarding ]]; then
+    return
+  fi
+
+  local cluster_network
+  cluster_network="$("${container_cli}" network inspect "${cluster_name}" 2>/dev/null || true)"
+
+  if [[ -z "${cluster_network}" ]]; then
+    "${container_cli}" network create "${cluster_name}" >/dev/null
+    return
+  fi
+
+  if grep -q '"ipv6_enabled": true' <<<"${cluster_network}"; then
+    if ! grep -q '"containers": {}' <<<"${cluster_network}"; then
+      cat >&2 <<EOF
+The existing podman network "${cluster_name}" has IPv6 enabled, but this kernel boots with IPv6 disabled.
+Remove the existing cluster/network, or recreate the network without IPv6, then rerun mkcluster.
+EOF
+      exit 1
+    fi
+
+    "${container_cli}" network rm "${cluster_name}" >/dev/null
+    "${container_cli}" network create "${cluster_name}" >/dev/null
+  fi
+}
+
+function ensure_registry() {
+  if [ "$("${container_cli}" inspect -f '{{.State.Running}}' "${registry_name}" 2>/dev/null || true)" != 'true' ]; then
+    "${container_cli}" run \
+      -d \
+      --restart=always \
+      -p "127.0.0.1:${registry_port}:5000" \
+      --name "${registry_name}" \
+      registry:2
+  fi
+}
+
+function emit_kind_config() {
+  cat <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+EOF
+
+  if (( ${#feature_gates[@]} > 0 )); then
+    echo "featureGates:"
+    local gate
+    for gate in "${feature_gates[@]}"; do
+      printf '  %s' "$(normalize_feature_gate "${gate}")"
+    done
+  fi
+
+  cat <<EOF
+networking:
+  apiServerAddress: "${api_server_address}"
+  apiServerPort: ${api_server_port}
+  ipFamily: ${ip_family}
+EOF
+
+  cat <<EOF
+nodes:
+  - role: control-plane
+    labels:
+      ingress-ready: "true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+      - containerPort: 443
+        hostPort: 443
+EOF
+
+  local worker_index
+  for ((worker_index = 0; worker_index < worker_count; worker_index++)); do
+    echo "  - role: worker"
+    if [[ "${gpu_enabled}" == true ]]; then
+      cat <<EOF
+    labels:
+      gpu: "true"
+EOF
+    fi
+  done
+}
+
+function create_cluster() {
+  local create_args=(create cluster --name "${cluster_name}")
+  create_args+=("${kind_extra_args[@]}")
+  if [[ -n "${kind_node_image}" ]]; then
+    create_args+=(--image "${kind_node_image}")
+  fi
+  create_args+=(--config=-)
+  emit_kind_config | kind "${create_args[@]}"
+}
+
+function load_kind_nodes() {
+  mapfile -t kind_nodes < <(kind get nodes --name "${cluster_name}")
+  (( ${#kind_nodes[@]} > 0 )) || die "No nodes found for cluster ${cluster_name}"
+}
+
+function connect_registry_network() {
+  if [ "$("${container_cli}" inspect -f="{{json (index .NetworkSettings.Networks \"${cluster_name}\")}}" "${registry_name}")" = 'null' ]; then
+    "${container_cli}" network connect "${cluster_name}" "${registry_name}"
+  fi
+}
+
+function configure_registry_for_nodes() {
+  local registry_dir="/etc/containerd/certs.d/localhost:${registry_port}"
+  local node
+
+  for node in "${kind_nodes[@]}"; do
+    "${container_cli}" exec "${node}" mkdir -p "${registry_dir}"
+    cat <<EOF | "${container_cli}" exec -i "${node}" cp /dev/stdin "${registry_dir}/hosts.toml"
+[host."http://${registry_name}:5000"]
+EOF
+  done
+}
+
+function annotate_registry() {
+  local node
+
+  for node in "${kind_nodes[@]}"; do
+    kubectl annotate --overwrite node "${node}" "kind.x-k8s.io/registry=localhost:${registry_port}"
+  done
+}
+
+function document_local_registry() {
+  cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-registry-hosting
+  namespace: kube-public
+data:
+  localRegistryHosting.v1: |
+    host: "localhost:${registry_port}"
+    help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
+EOF
+}
+
+initialize_defaults
+parse_args "$@"
+validate_args
+check_deps
+linux_preflight
+container_cli="$(detect_container_cli)"
+gpu_preflight
+ensure_podman_kind_network
+ensure_registry
+create_cluster
+load_kind_nodes
+connect_registry_network
+configure_registry_for_nodes
+annotate_registry
+document_local_registry
+
+info "Cluster ${cluster_name} is ready."
