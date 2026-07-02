@@ -1,0 +1,35 @@
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: nvidia-gpu-claim-template
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          exactly:
+            allocationMode: ExactCount
+            count: 1
+            deviceClassName: gpu.nvidia.com
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nvidia-dra-smoke
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    gpu: "true"
+  resourceClaims:
+    - name: gpu
+      resourceClaimTemplateName: nvidia-gpu-claim-template
+  containers:
+    - name: cuda
+      image: nvidia/cuda:12.9.1-base-ubuntu24.04
+      command:
+        - /bin/bash
+        - -lc
+        - nvidia-smi && sleep infinity
+      resources:
+        claims:
+          - name: gpu

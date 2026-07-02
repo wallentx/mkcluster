@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-KIND_VERSION='v0.31.0'
+FALLBACK_KIND_VERSION='v0.31.0'
 KIND_RELEASES_LATEST_URL='https://github.com/kubernetes-sigs/kind/releases/latest'
+KIND_RELEASES_API_LATEST_URL='https://api.github.com/repos/kubernetes-sigs/kind/releases/latest'
 NVIDIA_DRA_DRIVER_RELEASE='nvidia-dra-driver-gpu'
 NVIDIA_DRA_DRIVER_NAMESPACE='nvidia-dra-driver-gpu'
-NVIDIA_DRA_DRIVER_CHART_VERSION="${MKCLUSTER_NVIDIA_DRA_DRIVER_CHART_VERSION:-25.12.0}"
+NVIDIA_HELM_INDEX_URL='https://helm.ngc.nvidia.com/nvidia/index.yaml'
+FALLBACK_NVIDIA_DRA_DRIVER_CHART_VERSION='25.12.0'
+REMOTE_LOOKUP_TIMEOUT="${MKCLUSTER_REMOTE_LOOKUP_TIMEOUT:-5}"
+KIND_VERSION=''
+KIND_LATEST_RELEASE_JSON=''
+NVIDIA_DRA_DRIVER_CHART_VERSION=''
 NVIDIA_DRA_DRIVER_ROOT="${MKCLUSTER_NVIDIA_DRA_DRIVER_ROOT:-/}"
 OPTION_LABEL_WIDTH=31
 OPTION_DESC_WIDTH=54
@@ -16,6 +22,7 @@ DEFAULT_REGISTRY_PORT=''
 DEFAULT_WORKER_COUNT=''
 DEFAULT_IP_FAMILY=''
 DEFAULT_KUBERNETES_VERSION=''
+DEFAULT_KIND_NODE_IMAGE=''
 DEFAULT_PROVIDER=''
 DEFAULT_API_SERVER_ADDRESS=''
 DEFAULT_API_SERVER_PORT=''
@@ -39,6 +46,7 @@ kind_extra_args=()
 kind_nodes=()
 feature_gates=()
 cluster_network_name=''
+action='create'
 
 if [[ -t 1 ]]; then
   color_reset=$'\033[0m'
@@ -83,6 +91,87 @@ function warn() {
 function die() {
   printf '%s%s%s\n' "${color_red}" "$*" "${color_reset}" >&2
   exit 1
+}
+
+# Short style helpers keep usage text readable without changing the renderer.
+function hd() {
+  printf '%s%s%s' "${color_heading}" "$*" "${color_reset}"
+}
+
+function sc() {
+  printf '%s%s%s' "${color_section}" "$*" "${color_reset}"
+}
+
+function lb() {
+  printf '%s%s%s' "${color_label}" "$*" "${color_reset}"
+}
+
+function mt() {
+  printf '%s%s%s' "${color_meta}" "$*" "${color_reset}"
+}
+
+function ex() {
+  printf '%s%s%s' "${color_example}" "$*" "${color_reset}"
+}
+
+function lt() {
+  printf '%s%s%s' "${color_literal}" "$*" "${color_reset}"
+}
+
+function bk() {
+  printf '%s[%s%s%s%s%s]%s' \
+    "${color_bracket}" "${color_reset}" "${color_bracket_text}" "$*" \
+    "${color_reset}" "${color_bracket}" "${color_reset}"
+}
+
+function df() {
+  printf '%s(%s%s%s%s%s)%s' \
+    "${color_meta}" "${color_reset}" "${color_value_meta}" "$*" \
+    "${color_reset}" "${color_meta}" "${color_reset}"
+}
+
+function bm() {
+  local name="$1"
+  local value="$2"
+
+  printf '%s%s%s%s[%s%s%s%s]%s' \
+    "${color_meta}" "${name}" "${color_reset}" \
+    "${color_bracket}" "${color_reset}" \
+    "${color_bracket_text}" "${value}" "${color_reset}${color_bracket}" \
+    "${color_reset}"
+}
+
+function op() {
+  local short="$1"
+  local long="$2"
+  local meta_plain="$3"
+  local description="$4"
+  local meta="${5:-}"
+  local label_plain="${short}, ${long}"
+  local label="${color_label}${short}${color_comma},${color_reset} ${color_label}${long}${color_reset}"
+
+  if [[ -n "${meta_plain}" ]]; then
+    label_plain+=" ${meta_plain}"
+    label+=" ${meta:-$(mt "${meta_plain}")}"
+  fi
+
+  print_option "${label_plain}" "${label}" "${description}"
+}
+
+function lo() {
+  local long="$1"
+  local meta_plain="$2"
+  local description="$3"
+  local meta="${4:-}"
+  local label_plain="${long}"
+  local label="${color_label}${long}${color_reset}"
+
+  if [[ -n "${meta_plain}" ]]; then
+    label_plain+=" ${meta_plain}"
+    label+=" ${meta:-$(mt "${meta_plain}")}"
+  fi
+
+  print_option "${label_plain}" "${label}" "${description}"
 }
 
 function spaces() {
@@ -229,12 +318,13 @@ function detect_default_cluster_name() {
 }
 
 function initialize_defaults() {
+  detect_remote_defaults
+
   DEFAULT_CLUSTER_NAME="$(detect_default_cluster_name)"
   DEFAULT_REGISTRY_NAME="${MKCLUSTER_REGISTRY_NAME:-kind-registry}"
   DEFAULT_REGISTRY_PORT="${MKCLUSTER_REGISTRY_PORT:-5001}"
   DEFAULT_WORKER_COUNT="${MKCLUSTER_WORKER_COUNT:-3}"
   DEFAULT_IP_FAMILY="${MKCLUSTER_IP_FAMILY:-ipv4}"
-  DEFAULT_KUBERNETES_VERSION='latest'
   DEFAULT_PROVIDER="${KIND_EXPERIMENTAL_PROVIDER:-docker}"
   DEFAULT_API_SERVER_ADDRESS="$(detect_default_api_server_address)"
   DEFAULT_API_SERVER_PORT="${MKCLUSTER_API_SERVER_PORT:-6443}"
@@ -254,43 +344,46 @@ function initialize_defaults() {
 
 function usage() {
   cat <<EOF
-${color_heading}mkcluster${color_reset}
-${color_example}Create a local kind cluster with an attached local registry and a small wrapper${color_reset}
-${color_example}around the more useful kind knobs.${color_reset}
+$(hd mkcluster)
+$(ex 'Create a local kind cluster with an attached local registry and a small wrapper')
+$(ex 'around the more useful kind knobs.')
 
-${color_section}Usage${color_reset}
-  ${color_label}mkcluster${color_reset} ${color_bracket}[${color_reset}${color_bracket_text}options${color_reset}${color_bracket}]${color_reset} ${color_bracket}[${color_reset}${color_bracket_text}kind create cluster args...${color_reset}${color_bracket}]${color_reset}
+$(sc Usage)
+  $(lb mkcluster) $(bk options) $(bk 'kind create cluster args...')
 
-${color_example}Pass extra ${color_label}kind create cluster${color_example} arguments only after ${color_label}--${color_example}.${color_reset}
+$(ex 'Pass extra ')$(lb 'kind create cluster')$(ex ' arguments only after ')$(lb --)$(ex '.')
 
-${color_section}Options${color_reset}
+$(sc Options)
 EOF
-  print_option '-g, --gpu' "${color_label}-g${color_comma},${color_reset} ${color_label}--gpu${color_reset}" "Install the NVIDIA DRA driver and label all worker nodes with ${color_literal}gpu=true${color_reset} ${color_meta}(${color_reset}${color_value_meta}disabled${color_reset}${color_meta})${color_reset}"
-  print_option '-d, --gpu-dra' "${color_label}-d${color_comma},${color_reset} ${color_label}--gpu-dra${color_reset}" "Install the NVIDIA DRA driver, enable experimental GPU DRA gates, and set ${color_literal}gpu=true${color_reset}"
-  print_option '-n, --name NAME' "${color_label}-n${color_comma},${color_reset} ${color_label}--name${color_reset} ${color_meta}NAME${color_reset}" "Set the cluster name ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_CLUSTER_NAME}${color_reset}${color_meta})${color_reset}"
-  print_option '-i, --ip-family FAMILY' "${color_label}-i${color_comma},${color_reset} ${color_label}--ip-family${color_reset} ${color_meta}FAMILY${color_reset}" "Set the kind networking ${color_literal}ipFamily${color_reset} ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_IP_FAMILY}${color_reset}${color_meta})${color_reset}"
-  print_option '-k, --k8s-version VERSION' "${color_label}-k${color_comma},${color_reset} ${color_label}--k8s-version${color_reset} ${color_meta}VERSION${color_reset}" "Set the k8s version to deploy ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_KUBERNETES_VERSION}${color_reset}${color_meta})${color_reset}"
-  print_option '-P, --provider PROVIDER' "${color_label}-P${color_comma},${color_reset} ${color_label}--provider${color_reset} ${color_meta}PROVIDER${color_reset}" "Set the container provider ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_PROVIDER}${color_reset}${color_meta})${color_reset}"
-  print_option '-a, --api-server-address IP' "${color_label}-a${color_comma},${color_reset} ${color_label}--api-server-address${color_reset} ${color_meta}IP${color_reset}" "Bind the k8s API server to a host IP ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_API_SERVER_ADDRESS}${color_reset}${color_meta})${color_reset}"
-  print_option '-p, --api-server-port PORT' "${color_label}-p${color_comma},${color_reset} ${color_label}--api-server-port${color_reset} ${color_meta}PORT${color_reset}" "Publish the API server on a fixed host port ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_API_SERVER_PORT}${color_reset}${color_meta})${color_reset}"
-  print_option '-W, --workers COUNT' "${color_label}-W${color_comma},${color_reset} ${color_label}--workers${color_reset} ${color_meta}COUNT${color_reset}" "Set the worker node count ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_WORKER_COUNT}${color_reset}${color_meta})${color_reset}"
-  print_option '-f, --feature-gate GATE[=BOOL]' "${color_label}-f${color_comma},${color_reset} ${color_label}--feature-gate${color_reset} ${color_meta}GATE${color_reset}${color_bracket}[${color_reset}${color_bracket_text}=BOOL${color_reset}${color_bracket}]${color_reset}" "Enable or disable a k8s feature gate"
-  print_option '-l, --latest-kind-version' "${color_label}-l${color_comma},${color_reset} ${color_label}--latest-kind-version${color_reset}" "Print the latest kind release tag and exit"
-  print_option '-r, --retain' "${color_label}-r${color_comma},${color_reset} ${color_label}--retain${color_reset}" "Retain nodes when cluster creation fails"
-  print_option '-w, --wait DURATION' "${color_label}-w${color_comma},${color_reset} ${color_label}--wait${color_reset} ${color_meta}DURATION${color_reset}" "Wait for cluster readiness, e.g. ${color_literal}5m${color_reset}"
-  print_option '-h, --help' "${color_label}-h${color_comma},${color_reset} ${color_label}--help${color_reset}" "Show this help"
+  op -g --gpu '' "Install the NVIDIA DRA driver and label all worker nodes with $(lt gpu=true) $(df disabled)"
+  op -d --gpu-dra '' "Install the NVIDIA DRA driver, enable experimental GPU DRA gates, and set $(lt gpu=true)"
+  op -n --name NAME "Set the cluster name $(df "${DEFAULT_CLUSTER_NAME}")"
+  op -i --ip-family FAMILY "Set the kind networking $(lt ipFamily) $(df "${DEFAULT_IP_FAMILY}")"
+  op -k --k8s-version VERSION "Set the k8s version to deploy $(df "${DEFAULT_KUBERNETES_VERSION}")"
+  op -P --provider PROVIDER "Set the container provider $(df "${DEFAULT_PROVIDER}")"
+  op -a --api-server-address IP "Bind the k8s API server to a host IP $(df "${DEFAULT_API_SERVER_ADDRESS}")"
+  op -p --api-server-port PORT "Publish the API server on a fixed host port $(df "${DEFAULT_API_SERVER_PORT}")"
+  op -W --workers COUNT "Set the worker node count $(df "${DEFAULT_WORKER_COUNT}")"
+  op -f --feature-gate 'GATE[=BOOL]' 'Enable or disable a k8s feature gate' "$(bm GATE '=BOOL')"
+  op -l --latest-kind-version '' 'Print the latest kind release tag and exit'
+  op -L --latest-versions '' 'Print detected latest kind, k8s, and NVIDIA DRA versions'
+  lo --repair-gpu-mounts '' 'Refresh worker NVIDIA libraries and restart DRA pods'
+  op -r --retain '' 'Retain nodes when cluster creation fails'
+  op -w --wait DURATION "Wait for cluster readiness, e.g. $(lt 5m)"
+  op -h --help '' 'Show this help'
   cat <<EOF
 
-${color_section}Examples${color_reset}
-  ${color_example}mkcluster${color_reset}
-  ${color_example}mkcluster -g${color_reset}
-  ${color_example}mkcluster -d${color_reset}
-  ${color_example}mkcluster -k 1.34${color_reset}
-  ${color_example}mkcluster -P nerdctl${color_reset}
-  ${color_example}mkcluster --feature-gate MemoryQoS=true${color_reset}
-  ${color_example}mkcluster -n dev --retain${color_reset}
-  ${color_example}HOST_IP=192.0.2.10 mkcluster -n dev -i dual -a "\$HOST_IP" -p 6443 --wait 5m${color_reset}
-  ${color_example}mkcluster -- --verbosity=4${color_reset}
+$(sc Examples)
+  $(ex mkcluster)
+  $(ex 'mkcluster -g')
+  $(ex 'mkcluster -d')
+  $(ex 'mkcluster -k 1.34')
+  $(ex 'mkcluster -P nerdctl')
+  $(ex 'mkcluster --feature-gate MemoryQoS=true')
+  $(ex 'mkcluster -n dev --retain')
+  $(ex 'mkcluster --repair-gpu-mounts')
+  $(ex 'HOST_IP=192.0.2.10 mkcluster -n dev -i dual -a "$HOST_IP" -p 6443 --wait 5m')
+  $(ex 'mkcluster -- --verbosity=4')
 EOF
 }
 
@@ -355,42 +448,245 @@ function ensure_feature_gate_default() {
   feature_gates+=("${desired_gate}=true")
 }
 
-function print_latest_kind_version() {
-  command -v curl &>/dev/null || die "curl is required for --latest-kind-version"
+function fetch_url() {
+  local url="$1"
 
-  local latest_url
-  latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}\n' "${KIND_RELEASES_LATEST_URL}")" ||
+  command -v curl &>/dev/null || return 1
+  curl -fsSL --connect-timeout "${REMOTE_LOOKUP_TIMEOUT}" --max-time "${REMOTE_LOOKUP_TIMEOUT}" "${url}" 2>/dev/null
+}
+
+function fetch_effective_url() {
+  local url="$1"
+
+  command -v curl &>/dev/null || return 1
+  curl -fsSLI -o /dev/null -w '%{url_effective}\n' \
+    --connect-timeout "${REMOTE_LOOKUP_TIMEOUT}" \
+    --max-time "${REMOTE_LOOKUP_TIMEOUT}" \
+    "${url}" 2>/dev/null
+}
+
+function kind_release_tag_from_json() {
+  local release_json="$1"
+
+  sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"${release_json}" | head -n1
+}
+
+function kind_node_images_from_release() {
+  local release_text="$1"
+
+  grep -Eo 'kindest/node:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[[:xdigit:]]{64}' <<<"${release_text}" |
+    awk '!seen[$0]++'
+}
+
+function kind_node_image_k8s_version() {
+  local image="$1"
+
+  sed -n 's/.*kindest\/node:v\([0-9][0-9.]*\)@sha256:.*/\1/p' <<<"${image}" | head -n1
+}
+
+function detect_latest_kind_version() {
+  local release_json="${1:-}"
+  local version=''
+
+  if [[ -n "${release_json}" ]]; then
+    version="$(kind_release_tag_from_json "${release_json}")"
+  fi
+
+  if [[ -z "${version}" ]]; then
+    local latest_url
+    latest_url="$(fetch_effective_url "${KIND_RELEASES_LATEST_URL}")" || return 1
+    version="${latest_url##*/}"
+  fi
+
+  [[ -n "${version}" ]] || return 1
+  printf '%s\n' "${version}"
+}
+
+function detect_latest_kind_node_image() {
+  local release_json="${1:-}"
+
+  [[ -n "${release_json}" ]] || release_json="$(fetch_url "${KIND_RELEASES_API_LATEST_URL}")" || return 1
+  kind_node_images_from_release "${release_json}" | head -n1
+}
+
+function detect_latest_k8s_version() {
+  local release_json="${1:-}"
+  local node_image=''
+
+  node_image="$(detect_latest_kind_node_image "${release_json}" || true)"
+  [[ -n "${node_image}" ]] || return 1
+  kind_node_image_k8s_version "${node_image}"
+}
+
+function detect_latest_nvidia_dra_driver_chart_version() {
+  local index_yaml
+
+  index_yaml="$(fetch_url "${NVIDIA_HELM_INDEX_URL}")" || return 1
+  awk -v chart="${NVIDIA_DRA_DRIVER_RELEASE}" '
+    $0 ~ "^  " chart ":" {
+      in_chart = 1
+      next
+    }
+    in_chart && /^  [^[:space:]-][^:]*:/ {
+      exit
+    }
+    in_chart && /^[[:space:]]*-[[:space:]]*version:/ {
+      gsub(/"/, "", $3)
+      print $3
+      exit
+    }
+    in_chart && /^[[:space:]]+version:/ {
+      gsub(/"/, "", $2)
+      print $2
+      exit
+    }
+  ' <<<"${index_yaml}"
+}
+
+function print_latest_kind_version() {
+  local version
+  version="$(detect_latest_kind_version "${KIND_LATEST_RELEASE_JSON}" || true)"
+
+  [[ -n "${version}" ]] ||
     die "Failed to retrieve the latest kind release tag from ${KIND_RELEASES_LATEST_URL}"
 
-  printf '%s\n' "${latest_url##*/}"
+  printf '%s\n' "${version}"
+}
+
+function print_latest_versions() {
+  local kind_version=''
+  local node_image=''
+  local k8s_version=''
+  local dra_chart_version=''
+
+  kind_version="$(detect_latest_kind_version "${KIND_LATEST_RELEASE_JSON}" || true)"
+  node_image="$(detect_latest_kind_node_image "${KIND_LATEST_RELEASE_JSON}" || true)"
+  k8s_version="$(kind_node_image_k8s_version "${node_image}" || true)"
+  dra_chart_version="$(detect_latest_nvidia_dra_driver_chart_version || true)"
+
+  [[ -n "${kind_version}" ]] || die "Failed to retrieve the latest kind release tag."
+  [[ -n "${k8s_version}" ]] || die "Failed to retrieve the latest kind node image k8s version."
+  [[ -n "${dra_chart_version}" ]] || die "Failed to retrieve the latest NVIDIA DRA Helm chart version."
+
+  printf 'kind %s\n' "${kind_version}"
+  printf 'k8s %s\n' "${k8s_version}"
+  printf 'nvidia-dra %s\n' "${dra_chart_version}"
+}
+
+function resolve_kind_release_node_image() {
+  local version="${1#v}"
+  local escaped_version="${version//./\\.}"
+  local version_pattern=''
+
+  [[ -n "${KIND_LATEST_RELEASE_JSON}" ]] || return 1
+
+  if [[ "${version}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    version_pattern="v${escaped_version}\\.[0-9]+"
+  elif [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    version_pattern="v${escaped_version}"
+  else
+    return 1
+  fi
+
+  kind_node_images_from_release "${KIND_LATEST_RELEASE_JSON}" |
+    grep -E "kindest/node:${version_pattern}@sha256:[[:xdigit:]]{64}" |
+    head -n1
 }
 
 function resolve_kind_node_image() {
   local version="${1#v}"
+  local release_node_image=''
 
   case "${version}" in
     latest)
-      printf '%s\n' ''
-      ;;
-    1.35|1.35.0)
-      printf '%s\n' 'kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f'
-      ;;
-    1.34|1.34.3)
-      printf '%s\n' 'kindest/node:v1.34.3@sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48'
-      ;;
-    1.33|1.33.7)
-      printf '%s\n' 'kindest/node:v1.33.7@sha256:d26ef333bdb2cbe9862a0f7c3803ecc7b4303d8cea8e814b481b09949d353040'
-      ;;
-    1.32|1.32.11)
-      printf '%s\n' 'kindest/node:v1.32.11@sha256:5fc52d52a7b9574015299724bd68f183702956aa4a2116ae75a63cb574b35af8'
-      ;;
-    1.31|1.31.14)
-      printf '%s\n' 'kindest/node:v1.31.14@sha256:6f86cf509dbb42767b6e79debc3f2c32e4ee01386f0489b3b2be24b0a55aac2b'
+      printf '%s\n' "${DEFAULT_KIND_NODE_IMAGE}"
       ;;
     *)
-      die "Unsupported k8s version: ${1}. Supported values: latest, 1.35, 1.34, 1.33, 1.32, 1.31"
+      release_node_image="$(resolve_kind_release_node_image "${version}" || true)"
+      if [[ -n "${release_node_image}" ]]; then
+        printf '%s\n' "${release_node_image}"
+        return
+      fi
+
+      case "${version}" in
+        1.36|1.36.1)
+          printf '%s\n' 'kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5'
+          ;;
+        1.35|1.35.5)
+          printf '%s\n' 'kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95'
+          ;;
+        1.34|1.34.8)
+          printf '%s\n' 'kindest/node:v1.34.8@sha256:02722c2dedddcfc00febf5d27fbeb9b7b2c14294c82109ff4a85d89ac9ba3256'
+          ;;
+        1.33|1.33.12)
+          printf '%s\n' 'kindest/node:v1.33.12@sha256:3f5c8443c620245e4d355cfe09e96a91ead32ceaa569d3f1ca9edf0cb2fe2ff4'
+          ;;
+        1.32|1.32.11)
+          printf '%s\n' 'kindest/node:v1.32.11@sha256:5fc52d52a7b9574015299724bd68f183702956aa4a2116ae75a63cb574b35af8'
+          ;;
+        1.31|1.31.14)
+          printf '%s\n' 'kindest/node:v1.31.14@sha256:6f86cf509dbb42767b6e79debc3f2c32e4ee01386f0489b3b2be24b0a55aac2b'
+          ;;
+        *)
+          die "Unsupported k8s version: ${1}. Supported values: latest, 1.36, 1.35, 1.34, 1.33, 1.32, 1.31"
+          ;;
+      esac
       ;;
   esac
+}
+
+function detect_remote_defaults() {
+  local detected_kind_version=''
+  local detected_k8s_version=''
+  local detected_dra_chart_version=''
+
+  if [[ "${action}" == "repair_gpu_mounts" ]]; then
+    KIND_VERSION="${MKCLUSTER_KIND_VERSION:-${FALLBACK_KIND_VERSION}}"
+    DEFAULT_KUBERNETES_VERSION="${MKCLUSTER_K8S_VERSION:-${MKCLUSTER_KUBERNETES_VERSION:-latest}}"
+    NVIDIA_DRA_DRIVER_CHART_VERSION="${MKCLUSTER_NVIDIA_DRA_DRIVER_CHART_VERSION:-${FALLBACK_NVIDIA_DRA_DRIVER_CHART_VERSION}}"
+    return
+  fi
+
+  if [[ -z "${MKCLUSTER_KIND_VERSION:-}" && -z "${MKCLUSTER_KIND_NODE_IMAGE:-}" ]]; then
+    KIND_LATEST_RELEASE_JSON="$(fetch_url "${KIND_RELEASES_API_LATEST_URL}" || true)"
+  fi
+
+  detected_kind_version="${MKCLUSTER_KIND_VERSION:-}"
+  if [[ -z "${detected_kind_version}" ]]; then
+    detected_kind_version="$(detect_latest_kind_version "${KIND_LATEST_RELEASE_JSON}" || true)"
+  fi
+  KIND_VERSION="${detected_kind_version:-${FALLBACK_KIND_VERSION}}"
+
+  DEFAULT_KIND_NODE_IMAGE="${MKCLUSTER_KIND_NODE_IMAGE:-}"
+  if [[ -z "${DEFAULT_KIND_NODE_IMAGE}" && -n "${KIND_LATEST_RELEASE_JSON}" ]]; then
+    DEFAULT_KIND_NODE_IMAGE="$(detect_latest_kind_node_image "${KIND_LATEST_RELEASE_JSON}" || true)"
+  fi
+
+  detected_k8s_version="${MKCLUSTER_K8S_VERSION:-${MKCLUSTER_KUBERNETES_VERSION:-}}"
+  if [[ -z "${detected_k8s_version}" ]]; then
+    detected_k8s_version="$(kind_node_image_k8s_version "${DEFAULT_KIND_NODE_IMAGE}" || true)"
+  fi
+  DEFAULT_KUBERNETES_VERSION="${detected_k8s_version:-latest}"
+
+  detected_dra_chart_version="${MKCLUSTER_NVIDIA_DRA_DRIVER_CHART_VERSION:-}"
+  if [[ -z "${detected_dra_chart_version}" ]]; then
+    detected_dra_chart_version="$(detect_latest_nvidia_dra_driver_chart_version || true)"
+  fi
+  NVIDIA_DRA_DRIVER_CHART_VERSION="${detected_dra_chart_version:-${FALLBACK_NVIDIA_DRA_DRIVER_CHART_VERSION}}"
+}
+
+function prescan_action() {
+  while (($#)); do
+    case "$1" in
+      --repair-gpu-mounts)
+        action='repair_gpu_mounts'
+        ;;
+      --)
+        break
+        ;;
+    esac
+    shift
+  done
 }
 
 function parse_args() {
@@ -403,6 +699,14 @@ function parse_args() {
       -l|--latest-kind-version)
         print_latest_kind_version
         exit 0
+        ;;
+      -L|--latest-versions)
+        print_latest_versions
+        exit 0
+        ;;
+      --repair-gpu-mounts)
+        action='repair_gpu_mounts'
+        shift
         ;;
       -g|--gpu)
         gpu_enabled=true
@@ -732,6 +1036,97 @@ function detect_gpu_mounts() {
   append_gpu_mount_if_present "${libcuda_real_path}" "${node_library_dir}/$(basename "${libcuda_real_path}")"
 }
 
+function require_gpu_repair_prereqs() {
+  [[ $OSTYPE =~ ^linux ]] || die "GPU mount repair is only implemented on Linux hosts."
+
+  command -v kind &>/dev/null || die "GPU mount repair requires kind on the host."
+  command -v kubectl &>/dev/null || die "GPU mount repair requires kubectl on the host."
+  command -v nvidia-smi &>/dev/null || die "GPU mount repair requires nvidia-smi on the host."
+  command -v ldconfig &>/dev/null || die "GPU mount repair requires ldconfig on the host."
+  command -v readlink &>/dev/null || die "GPU mount repair requires readlink on the host."
+  nvidia-smi -L &>/dev/null || die "nvidia-smi could not enumerate any GPUs."
+}
+
+function is_worker_node_container() {
+  local node="$1"
+
+  [[ "${node}" != *control-plane* ]]
+}
+
+function repair_gpu_mount_file() {
+  local node="$1"
+  local host_path="$2"
+  local container_path="$3"
+  local resolved_host_path=''
+  local container_dir=''
+
+  resolved_host_path="$(readlink -f "${host_path}")"
+  [[ -n "${resolved_host_path}" && -f "${resolved_host_path}" ]] ||
+    die "Could not resolve repair source file: ${host_path}"
+
+  container_dir="${container_path%/*}"
+  info "Repairing ${node}:${container_path} from ${resolved_host_path}"
+  "${container_cli}" exec "${node}" mkdir -p "${container_dir}"
+  "${container_cli}" exec "${node}" rm -f "${container_path}"
+  "${container_cli}" cp "${resolved_host_path}" "${node}:${container_path}"
+}
+
+function repair_worker_gpu_mounts() {
+  local node=''
+  local gpu_mount=''
+  local host_path=''
+  local container_path=''
+  local repaired_workers=0
+
+  for node in "${kind_nodes[@]}"; do
+    is_worker_node_container "${node}" || continue
+    ((repaired_workers += 1))
+    for gpu_mount in "${gpu_mounts[@]}"; do
+      IFS='|' read -r host_path container_path <<<"${gpu_mount}"
+      repair_gpu_mount_file "${node}" "${host_path}" "${container_path}"
+    done
+  done
+
+  ((repaired_workers > 0)) || die "No worker containers found for cluster ${cluster_name}"
+}
+
+function restart_nvidia_dra_pods() {
+  local context="kind-${cluster_name}"
+  local daemonset_name="${NVIDIA_DRA_DRIVER_RELEASE}-kubelet-plugin"
+  local -a pods=()
+
+  if ! kubectl --context "${context}" get namespace "${NVIDIA_DRA_DRIVER_NAMESPACE}" >/dev/null 2>&1; then
+    warn "Namespace ${NVIDIA_DRA_DRIVER_NAMESPACE} was not found; skipping DRA pod restart."
+    return
+  fi
+
+  mapfile -t pods < <(
+    kubectl --context "${context}" -n "${NVIDIA_DRA_DRIVER_NAMESPACE}" get pods -o name 2>/dev/null |
+      grep "^pod/${daemonset_name}-" || true
+  )
+
+  if (( ${#pods[@]} == 0 )); then
+    warn "No ${daemonset_name} pods found to restart."
+  else
+    kubectl --context "${context}" -n "${NVIDIA_DRA_DRIVER_NAMESPACE}" delete "${pods[@]}" --wait=false
+  fi
+
+  if kubectl --context "${context}" -n "${NVIDIA_DRA_DRIVER_NAMESPACE}" get daemonset "${daemonset_name}" >/dev/null 2>&1; then
+    kubectl --context "${context}" -n "${NVIDIA_DRA_DRIVER_NAMESPACE}" rollout status "daemonset/${daemonset_name}" --timeout=2m ||
+      warn "Timed out waiting for ${daemonset_name} rollout; check pod logs for remaining DRA issues."
+  fi
+}
+
+function repair_gpu_mounts() {
+  require_gpu_repair_prereqs
+  container_cli="$(detect_container_cli)"
+  detect_gpu_mounts
+  load_kind_nodes
+  repair_worker_gpu_mounts
+  restart_nvidia_dra_pods
+  info "GPU mounts repaired for cluster ${cluster_name}."
+}
+
 function require_gpu_provider_prereqs() {
   case "${container_cli}" in
     docker)
@@ -959,7 +1354,7 @@ kubeletPlugin:
     nvidia.com/dra-kubelet-plugin: "true"
 EOF
 
-  info "Installing NVIDIA DRA driver via Helm..."
+  info "Installing NVIDIA DRA driver ${NVIDIA_DRA_DRIVER_CHART_VERSION} via Helm..."
   helm repo add nvidia https://helm.ngc.nvidia.com/nvidia >/dev/null 2>&1 || true
   helm repo update || die "Failed to update the NVIDIA Helm repository."
   helm upgrade -i "${NVIDIA_DRA_DRIVER_RELEASE}" nvidia/nvidia-dra-driver-gpu \
@@ -973,9 +1368,14 @@ EOF
   rm -f "${values_file}"
 }
 
+prescan_action "$@"
 initialize_defaults
 parse_args "$@"
 validate_args
+if [[ "${action}" == "repair_gpu_mounts" ]]; then
+  repair_gpu_mounts
+  exit 0
+fi
 check_deps
 linux_preflight
 container_cli="$(detect_container_cli)"

@@ -1,0 +1,16 @@
+# Minimal MetalLB values for a kind or homelab cluster using Layer 2 mode.
+#
+# MetalLB itself does not allocate addresses until you also apply an
+# IPAddressPool and an L2Advertisement.
+
+controller:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+
+speaker:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
