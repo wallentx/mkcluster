@@ -7,6 +7,8 @@ NVIDIA_DRA_DRIVER_RELEASE='nvidia-dra-driver-gpu'
 NVIDIA_DRA_DRIVER_NAMESPACE='nvidia-dra-driver-gpu'
 NVIDIA_DRA_DRIVER_CHART_VERSION="${MKCLUSTER_NVIDIA_DRA_DRIVER_CHART_VERSION:-25.12.0}"
 NVIDIA_DRA_DRIVER_ROOT="${MKCLUSTER_NVIDIA_DRA_DRIVER_ROOT:-/}"
+OPTION_LABEL_WIDTH=31
+OPTION_DESC_WIDTH=54
 
 DEFAULT_CLUSTER_NAME=''
 DEFAULT_REGISTRY_NAME=''
@@ -81,6 +83,78 @@ function warn() {
 function die() {
   printf '%s%s%s\n' "${color_red}" "$*" "${color_reset}" >&2
   exit 1
+}
+
+function spaces() {
+  local count="$1"
+  local padding=''
+
+  while ((count > 0)); do
+    padding+=' '
+    ((count--))
+  done
+
+  printf '%s' "${padding}"
+}
+
+function strip_ansi() {
+  printf '%s' "$1" | sed $'s/\x1b\\[[0-9;]*m//g'
+}
+
+function visible_length() {
+  local plain
+  plain="$(strip_ansi "$1")"
+  printf '%s' "${#plain}"
+}
+
+function print_wrapped_text() {
+  local first_indent="$1"
+  local continuation_indent="$2"
+  local width="$3"
+  local text="$4"
+  local line=''
+  local word=''
+  local candidate=''
+  local line_indent="${first_indent}"
+  local -a words=()
+
+  read -r -a words <<< "${text}"
+
+  for word in "${words[@]}"; do
+    if [[ -z "${line}" ]]; then
+      candidate="${word}"
+    else
+      candidate="${line} ${word}"
+    fi
+
+    if [[ -n "${line}" ]] && (($(visible_length "${candidate}") > width)); then
+      printf '%s%s\n' "${line_indent}" "${line}"
+      line="${word}"
+      line_indent="${continuation_indent}"
+    else
+      line="${candidate}"
+    fi
+  done
+
+  printf '%s%s\n' "${line_indent}" "${line}"
+}
+
+function print_option() {
+  local label_plain="$1"
+  local label="$2"
+  local description="$3"
+  local continuation_indent
+  continuation_indent="$(spaces "$((2 + OPTION_LABEL_WIDTH + 1))")"
+
+  printf '  %s' "${label}"
+
+  if ((${#label_plain} >= OPTION_LABEL_WIDTH)); then
+    printf '\n'
+    print_wrapped_text "${continuation_indent}" "${continuation_indent}" "${OPTION_DESC_WIDTH}" "${description}"
+  else
+    spaces "$((OPTION_LABEL_WIDTH - ${#label_plain} + 1))"
+    print_wrapped_text '' "${continuation_indent}" "${OPTION_DESC_WIDTH}" "${description}"
+  fi
 }
 
 function detect_linux_host_ip() {
@@ -190,20 +264,22 @@ ${color_section}Usage${color_reset}
 ${color_example}Pass extra ${color_label}kind create cluster${color_example} arguments only after ${color_label}--${color_example}.${color_reset}
 
 ${color_section}Options${color_reset}
-  ${color_label}-g${color_comma},${color_reset} ${color_label}--gpu${color_reset}                      Install the NVIDIA DRA driver and label all worker nodes with ${color_literal}gpu=true${color_reset} ${color_meta}(${color_reset}${color_value_meta}disabled${color_reset}${color_meta})${color_reset}
-  ${color_label}-d${color_comma},${color_reset} ${color_label}--gpu-dra${color_reset}                  Install the NVIDIA DRA driver, enable experimental GPU DRA gates, and set ${color_literal}gpu=true${color_reset}
-  ${color_label}-n${color_comma},${color_reset} ${color_label}--name${color_reset} ${color_meta}NAME${color_reset}                Set the cluster name ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_CLUSTER_NAME}${color_reset}${color_meta})${color_reset}
-  ${color_label}-i${color_comma},${color_reset} ${color_label}--ip-family${color_reset} ${color_meta}FAMILY${color_reset}         Set the kind networking ${color_literal}ipFamily${color_reset} ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_IP_FAMILY}${color_reset}${color_meta})${color_reset}
-  ${color_label}-k${color_comma},${color_reset} ${color_label}--kubernetes-version${color_reset} ${color_meta}VERSION${color_reset} Set the Kubernetes version to deploy ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_KUBERNETES_VERSION}${color_reset}${color_meta})${color_reset}
-  ${color_label}-P${color_comma},${color_reset} ${color_label}--provider${color_reset} ${color_meta}PROVIDER${color_reset}        Set the container provider ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_PROVIDER}${color_reset}${color_meta})${color_reset}
-  ${color_label}-a${color_comma},${color_reset} ${color_label}--api-server-address${color_reset} ${color_meta}IP${color_reset}    Bind the Kubernetes API server to a host IP ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_API_SERVER_ADDRESS}${color_reset}${color_meta})${color_reset}
-  ${color_label}-p${color_comma},${color_reset} ${color_label}--api-server-port${color_reset} ${color_meta}PORT${color_reset}     Publish the API server on a fixed host port ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_API_SERVER_PORT}${color_reset}${color_meta})${color_reset}
-  ${color_label}-W${color_comma},${color_reset} ${color_label}--workers${color_reset} ${color_meta}COUNT${color_reset}            Set the worker node count ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_WORKER_COUNT}${color_reset}${color_meta})${color_reset}
-  ${color_label}-f${color_comma},${color_reset} ${color_label}--feature-gate${color_reset} ${color_meta}GATE${color_reset}${color_bracket}[${color_reset}${color_bracket_text}=BOOL${color_reset}${color_bracket}]${color_reset} Enable or disable a Kubernetes feature gate
-  ${color_label}-l${color_comma},${color_reset} ${color_label}--latest-kind-version${color_reset}      Print the latest kind release tag and exit
-  ${color_label}-r${color_comma},${color_reset} ${color_label}--retain${color_reset}                   Retain nodes when cluster creation fails
-  ${color_label}-w${color_comma},${color_reset} ${color_label}--wait${color_reset} ${color_meta}DURATION${color_reset}            Wait for cluster readiness, e.g. ${color_literal}5m${color_reset}
-  ${color_label}-h${color_comma},${color_reset} ${color_label}--help${color_reset}                     Show this help
+EOF
+  print_option '-g, --gpu' "${color_label}-g${color_comma},${color_reset} ${color_label}--gpu${color_reset}" "Install the NVIDIA DRA driver and label all worker nodes with ${color_literal}gpu=true${color_reset} ${color_meta}(${color_reset}${color_value_meta}disabled${color_reset}${color_meta})${color_reset}"
+  print_option '-d, --gpu-dra' "${color_label}-d${color_comma},${color_reset} ${color_label}--gpu-dra${color_reset}" "Install the NVIDIA DRA driver, enable experimental GPU DRA gates, and set ${color_literal}gpu=true${color_reset}"
+  print_option '-n, --name NAME' "${color_label}-n${color_comma},${color_reset} ${color_label}--name${color_reset} ${color_meta}NAME${color_reset}" "Set the cluster name ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_CLUSTER_NAME}${color_reset}${color_meta})${color_reset}"
+  print_option '-i, --ip-family FAMILY' "${color_label}-i${color_comma},${color_reset} ${color_label}--ip-family${color_reset} ${color_meta}FAMILY${color_reset}" "Set the kind networking ${color_literal}ipFamily${color_reset} ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_IP_FAMILY}${color_reset}${color_meta})${color_reset}"
+  print_option '-k, --k8s-version VERSION' "${color_label}-k${color_comma},${color_reset} ${color_label}--k8s-version${color_reset} ${color_meta}VERSION${color_reset}" "Set the k8s version to deploy ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_KUBERNETES_VERSION}${color_reset}${color_meta})${color_reset}"
+  print_option '-P, --provider PROVIDER' "${color_label}-P${color_comma},${color_reset} ${color_label}--provider${color_reset} ${color_meta}PROVIDER${color_reset}" "Set the container provider ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_PROVIDER}${color_reset}${color_meta})${color_reset}"
+  print_option '-a, --api-server-address IP' "${color_label}-a${color_comma},${color_reset} ${color_label}--api-server-address${color_reset} ${color_meta}IP${color_reset}" "Bind the k8s API server to a host IP ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_API_SERVER_ADDRESS}${color_reset}${color_meta})${color_reset}"
+  print_option '-p, --api-server-port PORT' "${color_label}-p${color_comma},${color_reset} ${color_label}--api-server-port${color_reset} ${color_meta}PORT${color_reset}" "Publish the API server on a fixed host port ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_API_SERVER_PORT}${color_reset}${color_meta})${color_reset}"
+  print_option '-W, --workers COUNT' "${color_label}-W${color_comma},${color_reset} ${color_label}--workers${color_reset} ${color_meta}COUNT${color_reset}" "Set the worker node count ${color_meta}(${color_reset}${color_value_meta}${DEFAULT_WORKER_COUNT}${color_reset}${color_meta})${color_reset}"
+  print_option '-f, --feature-gate GATE[=BOOL]' "${color_label}-f${color_comma},${color_reset} ${color_label}--feature-gate${color_reset} ${color_meta}GATE${color_reset}${color_bracket}[${color_reset}${color_bracket_text}=BOOL${color_reset}${color_bracket}]${color_reset}" "Enable or disable a k8s feature gate"
+  print_option '-l, --latest-kind-version' "${color_label}-l${color_comma},${color_reset} ${color_label}--latest-kind-version${color_reset}" "Print the latest kind release tag and exit"
+  print_option '-r, --retain' "${color_label}-r${color_comma},${color_reset} ${color_label}--retain${color_reset}" "Retain nodes when cluster creation fails"
+  print_option '-w, --wait DURATION' "${color_label}-w${color_comma},${color_reset} ${color_label}--wait${color_reset} ${color_meta}DURATION${color_reset}" "Wait for cluster readiness, e.g. ${color_literal}5m${color_reset}"
+  print_option '-h, --help' "${color_label}-h${color_comma},${color_reset} ${color_label}--help${color_reset}" "Show this help"
+  cat <<EOF
 
 ${color_section}Examples${color_reset}
   ${color_example}mkcluster${color_reset}
@@ -312,7 +388,7 @@ function resolve_kind_node_image() {
       printf '%s\n' 'kindest/node:v1.31.14@sha256:6f86cf509dbb42767b6e79debc3f2c32e4ee01386f0489b3b2be24b0a55aac2b'
       ;;
     *)
-      die "Unsupported Kubernetes version: ${1}. Supported values: latest, 1.35, 1.34, 1.33, 1.32, 1.31"
+      die "Unsupported k8s version: ${1}. Supported values: latest, 1.35, 1.34, 1.33, 1.32, 1.31"
       ;;
   esac
 }
@@ -363,12 +439,12 @@ function parse_args() {
         provider="${1#*=}"
         shift
         ;;
-      -k|--kubernetes-version)
+      -k|--k8s-version)
         require_arg "$1" "${2:-}"
         kubernetes_version="$2"
         shift 2
         ;;
-      --kubernetes-version=*)
+      --k8s-version=*)
         kubernetes_version="${1#*=}"
         shift
         ;;
