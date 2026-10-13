@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-FALLBACK_KIND_VERSION='v0.31.0'
+(( BASH_VERSINFO[0] >= 4 )) || { echo "mkcluster requires Bash 4 or newer (on macOS: brew install bash)." >&2; exit 1; }
+
 KIND_RELEASES_LATEST_URL='https://github.com/kubernetes-sigs/kind/releases/latest'
 KIND_RELEASES_API_LATEST_URL='https://api.github.com/repos/kubernetes-sigs/kind/releases/latest'
 NVIDIA_DRA_DRIVER_RELEASE='nvidia-dra-driver-gpu'
 NVIDIA_DRA_DRIVER_NAMESPACE='nvidia-dra-driver-gpu'
 NVIDIA_HELM_INDEX_URL='https://helm.ngc.nvidia.com/nvidia/index.yaml'
-FALLBACK_NVIDIA_DRA_DRIVER_CHART_VERSION='25.12.0'
 REMOTE_LOOKUP_TIMEOUT="${MKCLUSTER_REMOTE_LOOKUP_TIMEOUT:-5}"
 KIND_VERSION=''
 KIND_LATEST_RELEASE_JSON=''
@@ -37,6 +37,8 @@ ip_family=''
 kubernetes_version=''
 provider=''
 kind_node_image=''
+node_image_explicit=false
+kubernetes_version_explicit=false
 api_server_address=''
 api_server_port=''
 container_cli=''
@@ -45,8 +47,22 @@ gpu_mounts=()
 kind_extra_args=()
 kind_nodes=()
 feature_gates=()
+cli_feature_gates=()
 cluster_network_name=''
 action='create'
+profile_path=''
+lock_path=''
+kubeconfig_path=''
+kubeconfig_explicit=false
+http_port=80
+https_port=443
+readiness_timeout=5m
+resume_enabled=false
+gpu_detected=false
+gpu_count=0
+cluster_exists=false
+stage='startup'
+
 
 if [[ -t 1 ]]; then
   color_reset=$'\033[0m'
@@ -106,10 +122,6 @@ function lb() {
   printf '%s%s%s' "${color_label}" "$*" "${color_reset}"
 }
 
-function mt() {
-  printf '%s%s%s' "${color_meta}" "$*" "${color_reset}"
-}
-
 function ex() {
   printf '%s%s%s' "${color_example}" "$*" "${color_reset}"
 }
@@ -152,7 +164,7 @@ function op() {
 
   if [[ -n "${meta_plain}" ]]; then
     label_plain+=" ${meta_plain}"
-    label+=" ${meta:-$(mt "${meta_plain}")}"
+    label+=" ${meta:-${color_meta}${meta_plain}${color_reset}}"
   fi
 
   print_option "${label_plain}" "${label}" "${description}"
@@ -168,31 +180,32 @@ function lo() {
 
   if [[ -n "${meta_plain}" ]]; then
     label_plain+=" ${meta_plain}"
-    label+=" ${meta:-$(mt "${meta_plain}")}"
+    label+=" ${meta:-${color_meta}${meta_plain}${color_reset}}"
   fi
 
   print_option "${label_plain}" "${label}" "${description}"
 }
 
 function spaces() {
-  local count="$1"
-  local padding=''
-
-  while ((count > 0)); do
-    padding+=' '
-    ((count--))
-  done
-
-  printf '%s' "${padding}"
+  printf '%*s' "$1" ''
 }
 
 function strip_ansi() {
-  printf '%s' "$1" | sed $'s/\x1b\\[[0-9;]*m//g'
+  local stripped="$1" sgr_pattern=$'\033''\[[0-9;]*m'
+  while [[ "${stripped}" =~ ${sgr_pattern} ]]; do
+    stripped="${stripped//"${BASH_REMATCH[0]}"/}"
+  done
+  # Internal callers can receive the result without a command substitution.
+  if (( $# > 1 )); then
+    printf -v "$2" '%s' "${stripped}"
+  else
+    printf '%s' "${stripped}"
+  fi
 }
 
 function visible_length() {
   local plain
-  plain="$(strip_ansi "$1")"
+  strip_ansi "$1" plain
   printf '%s' "${#plain}"
 }
 
@@ -203,7 +216,7 @@ function print_wrapped_text() {
   local text="$4"
   local line=''
   local word=''
-  local candidate=''
+  local candidate='' plain_candidate=''
   local line_indent="${first_indent}"
   local -a words=()
 
@@ -216,7 +229,8 @@ function print_wrapped_text() {
       candidate="${line} ${word}"
     fi
 
-    if [[ -n "${line}" ]] && (($(visible_length "${candidate}") > width)); then
+    strip_ansi "${candidate}" plain_candidate
+    if [[ -n "${line}" ]] && ((${#plain_candidate} > width)); then
       printf '%s%s\n' "${line_indent}" "${line}"
       line="${word}"
       line_indent="${continuation_indent}"
@@ -233,7 +247,7 @@ function print_option() {
   local label="$2"
   local description="$3"
   local continuation_indent
-  continuation_indent="$(spaces "$((2 + OPTION_LABEL_WIDTH + 1))")"
+  printf -v continuation_indent '%*s' "$((2 + OPTION_LABEL_WIDTH + 1))" ''
 
   printf '  %s' "${label}"
 
@@ -314,32 +328,43 @@ function detect_default_cluster_name() {
     host_name="$(hostname 2>/dev/null || true)"
   fi
 
+  host_name="$(printf '%s' "${host_name}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
   printf '%s\n' "${host_name:-kind}"
 }
 
 function initialize_defaults() {
-  detect_remote_defaults
-
-  DEFAULT_CLUSTER_NAME="$(detect_default_cluster_name)"
+  DEFAULT_CLUSTER_NAME="${MKCLUSTER_NAME:-$(detect_default_cluster_name)}"
   DEFAULT_REGISTRY_NAME="${MKCLUSTER_REGISTRY_NAME:-kind-registry}"
   DEFAULT_REGISTRY_PORT="${MKCLUSTER_REGISTRY_PORT:-5001}"
   DEFAULT_WORKER_COUNT="${MKCLUSTER_WORKER_COUNT:-3}"
   DEFAULT_IP_FAMILY="${MKCLUSTER_IP_FAMILY:-ipv4}"
-  DEFAULT_PROVIDER="${KIND_EXPERIMENTAL_PROVIDER:-docker}"
+  DEFAULT_PROVIDER="${MKCLUSTER_PROVIDER:-${KIND_EXPERIMENTAL_PROVIDER:-docker}}"
   DEFAULT_API_SERVER_ADDRESS="$(detect_default_api_server_address)"
   DEFAULT_API_SERVER_PORT="${MKCLUSTER_API_SERVER_PORT:-6443}"
-
+  DEFAULT_KUBERNETES_VERSION="${MKCLUSTER_K8S_VERSION:-${MKCLUSTER_KUBERNETES_VERSION:-latest}}"
+  DEFAULT_KIND_NODE_IMAGE="${MKCLUSTER_KIND_NODE_IMAGE:-}"
+  KIND_VERSION="${MKCLUSTER_KIND_VERSION:-}"
+  NVIDIA_DRA_DRIVER_CHART_VERSION="${MKCLUSTER_NVIDIA_DRA_DRIVER_CHART_VERSION:-}"
+  NVIDIA_DRA_DRIVER_ROOT="${MKCLUSTER_NVIDIA_DRA_DRIVER_ROOT:-/}"
   cluster_name="${DEFAULT_CLUSTER_NAME}"
   registry_name="${DEFAULT_REGISTRY_NAME}"
   registry_port="${DEFAULT_REGISTRY_PORT}"
   worker_count="${DEFAULT_WORKER_COUNT}"
-  gpu_enabled=false
-  gpu_dra_enabled=false
+  gpu_enabled="${MKCLUSTER_GPU:-false}"
+  gpu_dra_enabled="${MKCLUSTER_GPU_DRA:-false}"
   ip_family="${DEFAULT_IP_FAMILY}"
   kubernetes_version="${DEFAULT_KUBERNETES_VERSION}"
+  kind_node_image="${DEFAULT_KIND_NODE_IMAGE}"
   provider="${DEFAULT_PROVIDER}"
   api_server_address="${DEFAULT_API_SERVER_ADDRESS}"
   api_server_port="${DEFAULT_API_SERVER_PORT}"
+  http_port="${MKCLUSTER_HTTP_PORT:-80}"
+  https_port="${MKCLUSTER_HTTPS_PORT:-443}"
+  readiness_timeout="${MKCLUSTER_WAIT:-5m}"
+  kubeconfig_path="${MKCLUSTER_KUBECONFIG:-}"
+  if [[ -n "${MKCLUSTER_FEATURE_GATES:-}" ]]; then
+    IFS=',' read -r -a feature_gates <<<"${MKCLUSTER_FEATURE_GATES}"
+  fi
 }
 
 function usage() {
@@ -355,6 +380,17 @@ $(ex 'Pass extra ')$(lb 'kind create cluster')$(ex ' arguments only after ')$(lb
 
 $(sc Options)
 EOF
+  lo --profile FILE 'Load literal KEY=value settings (CLI > environment > profile)'
+  lo --write-lock FILE 'Save resolved settings for reuse with --profile'
+  lo --dry-run '' 'Print kind YAML without creating resources'
+  lo --doctor '' 'Check local prerequisites without changing the host'
+  lo --resume '' 'Finish setup of an existing cluster; never recreate it'
+  lo --kubeconfig FILE 'Use this kubeconfig for kind, kubectl, and Helm'
+  lo --node-image IMAGE 'Use an explicit kind node image (digest recommended)'
+  lo --http-port PORT 'Host HTTP port (default 80)'
+  lo --https-port PORT 'Host HTTPS port (default 443)'
+  lo --registry-name NAME 'Local registry container name'
+  lo --registry-port PORT 'Local registry port (default 5001)'
   op -g --gpu '' "Install the NVIDIA DRA driver and label all worker nodes with $(lt gpu=true) $(df disabled)"
   op -d --gpu-dra '' "Install the NVIDIA DRA driver, enable experimental GPU DRA gates, and set $(lt gpu=true)"
   op -n --name NAME "Set the cluster name $(df "${DEFAULT_CLUSTER_NAME}")"
@@ -371,18 +407,19 @@ EOF
   op -r --retain '' 'Retain nodes when cluster creation fails'
   op -w --wait DURATION "Wait for cluster readiness, e.g. $(lt 5m)"
   op -h --help '' 'Show this help'
+  # shellcheck disable=SC2016
   cat <<EOF
 
 $(sc Examples)
   $(ex mkcluster)
   $(ex 'mkcluster -g')
   $(ex 'mkcluster -d')
-  $(ex 'mkcluster -k 1.34')
+  $(ex 'mkcluster --profile examples/local.profile')
   $(ex 'mkcluster -P nerdctl')
   $(ex 'mkcluster --feature-gate MemoryQoS=true')
   $(ex 'mkcluster -n dev --retain')
   $(ex 'mkcluster --repair-gpu-mounts')
-  $(ex 'HOST_IP=192.0.2.10 mkcluster -n dev -i dual -a "$HOST_IP" -p 6443 --wait 5m')
+  $(ex 'mkcluster -n dev -i dual -a 192.0.2.10 -p 6443 --wait 5m')
   $(ex 'mkcluster -- --verbosity=4')
 EOF
 }
@@ -426,26 +463,29 @@ function normalize_feature_gate() {
     value=true
   fi
 
-  [[ -n "${name}" ]] || die "Feature gate name cannot be empty"
+  [[ "${name}" =~ ^[A-Za-z][A-Za-z0-9]*$ ]] || die "Invalid feature gate name: ${name}"
   printf '"%s": %s' "${name}" "${value}"
 }
 
-function feature_gate_name() {
-  local raw="$1"
-  printf '%s\n' "${raw%%=*}"
+function set_feature_gate() {
+  local desired="$1" name="${1%%=*}" existing
+  normalize_feature_gate "${desired}" >/dev/null
+  local -a remaining=()
+  for existing in "${feature_gates[@]}"; do
+    [[ "${existing%%=*}" == "${name}" ]] || remaining+=("${existing}")
+  done
+  feature_gates=("${remaining[@]}" "${desired}")
 }
 
-function ensure_feature_gate_default() {
-  local desired_gate="$1"
-  local existing_gate
-
-  for existing_gate in "${feature_gates[@]}"; do
-    if [[ "$(feature_gate_name "${existing_gate}")" == "${desired_gate}" ]]; then
-      return
-    fi
+function enable_dra_gate() {
+  local name="$1" gate explicit_gate=''
+  for gate in "${cli_feature_gates[@]}"; do
+    [[ "${gate%%=*}" != "${name}" ]] || explicit_gate="${gate}"
   done
-
-  feature_gates+=("${desired_gate}=true")
+  if [[ "${explicit_gate}" == *=* ]]; then
+    is_true "${explicit_gate#*=}" || die "--gpu-dra conflicts with explicitly disabled ${name}; use --gpu for custom gates."
+  fi
+  set_feature_gate "${name}=true"
 }
 
 function fetch_url() {
@@ -468,7 +508,7 @@ function fetch_effective_url() {
 function kind_release_tag_from_json() {
   local release_json="$1"
 
-  sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"${release_json}" | head -n1
+  sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"${release_json}" | awk 'NR == 1 { print }'
 }
 
 function kind_node_images_from_release() {
@@ -480,8 +520,9 @@ function kind_node_images_from_release() {
 
 function kind_node_image_k8s_version() {
   local image="$1"
-
-  sed -n 's/.*kindest\/node:v\([0-9][0-9.]*\)@sha256:.*/\1/p' <<<"${image}" | head -n1
+  if [[ "${image}" =~ (^|/)kindest/node:v([0-9]+\.[0-9]+\.[0-9]+)(@sha256:[[:xdigit:]]{64})?$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[2]}"
+  fi
 }
 
 function detect_latest_kind_version() {
@@ -506,16 +547,7 @@ function detect_latest_kind_node_image() {
   local release_json="${1:-}"
 
   [[ -n "${release_json}" ]] || release_json="$(fetch_url "${KIND_RELEASES_API_LATEST_URL}")" || return 1
-  kind_node_images_from_release "${release_json}" | head -n1
-}
-
-function detect_latest_k8s_version() {
-  local release_json="${1:-}"
-  local node_image=''
-
-  node_image="$(detect_latest_kind_node_image "${release_json}" || true)"
-  [[ -n "${node_image}" ]] || return 1
-  kind_node_image_k8s_version "${node_image}"
+  kind_node_images_from_release "${release_json}" | awk 'NR == 1 { print }'
 }
 
 function detect_latest_nvidia_dra_driver_chart_version() {
@@ -590,7 +622,7 @@ function resolve_kind_release_node_image() {
 
   kind_node_images_from_release "${KIND_LATEST_RELEASE_JSON}" |
     grep -E "kindest/node:${version_pattern}@sha256:[[:xdigit:]]{64}" |
-    head -n1
+    awk 'NR == 1 { print }'
 }
 
 function resolve_kind_node_image() {
@@ -628,7 +660,7 @@ function resolve_kind_node_image() {
           printf '%s\n' 'kindest/node:v1.31.14@sha256:6f86cf509dbb42767b6e79debc3f2c32e4ee01386f0489b3b2be24b0a55aac2b'
           ;;
         *)
-          die "Unsupported k8s version: ${1}. Supported values: latest, 1.36, 1.35, 1.34, 1.33, 1.32, 1.31"
+          die "Could not resolve k8s version ${1} from the selected kind release or bundled offline images. Supply --node-image with a compatible image digest."
           ;;
       esac
       ;;
@@ -636,179 +668,104 @@ function resolve_kind_node_image() {
 }
 
 function detect_remote_defaults() {
-  local detected_kind_version=''
-  local detected_k8s_version=''
-  local detected_dra_chart_version=''
-
-  if [[ "${action}" == "repair_gpu_mounts" ]]; then
-    KIND_VERSION="${MKCLUSTER_KIND_VERSION:-${FALLBACK_KIND_VERSION}}"
-    DEFAULT_KUBERNETES_VERSION="${MKCLUSTER_K8S_VERSION:-${MKCLUSTER_KUBERNETES_VERSION:-latest}}"
-    NVIDIA_DRA_DRIVER_CHART_VERSION="${MKCLUSTER_NVIDIA_DRA_DRIVER_CHART_VERSION:-${FALLBACK_NVIDIA_DRA_DRIVER_CHART_VERSION}}"
-    return
+  # Resolve only what the selected operation needs, after local validation.
+  if [[ -z "${KIND_VERSION}" ]] && command -v kind >/dev/null 2>&1; then
+    KIND_VERSION="$(kind version | awk '{print $2}')"
   fi
-
-  if [[ -z "${MKCLUSTER_KIND_VERSION:-}" && -z "${MKCLUSTER_KIND_NODE_IMAGE:-}" ]]; then
-    KIND_LATEST_RELEASE_JSON="$(fetch_url "${KIND_RELEASES_API_LATEST_URL}" || true)"
+  if [[ -z "${kind_node_image}" ]]; then
+    # Explicit versions need the release inventory too; the bundled image table
+    # remains a fallback when metadata is unavailable or has no matching image.
+    if [[ -z "${KIND_LATEST_RELEASE_JSON}" ]]; then
+      local release_url="${KIND_RELEASES_API_LATEST_URL}"
+      if [[ -n "${KIND_VERSION}" ]]; then
+        release_url="https://api.github.com/repos/kubernetes-sigs/kind/releases/tags/${KIND_VERSION}"
+      fi
+      KIND_LATEST_RELEASE_JSON="$(fetch_url "${release_url}" || true)"
+    fi
+    if [[ "${kubernetes_version}" == latest ]]; then
+      if [[ -n "${KIND_LATEST_RELEASE_JSON}" ]]; then
+        kind_node_image="$(kind_node_images_from_release "${KIND_LATEST_RELEASE_JSON}" | awk 'NR == 1 { print }')"
+      fi
+      [[ -n "${kind_node_image}" ]] || die "Cannot resolve a kind image. Supply --node-image or a pinned --profile for offline use."
+      kubernetes_version="$(kind_node_image_k8s_version "${kind_node_image}")"
+    else
+      kind_node_image="$(resolve_kind_node_image "${kubernetes_version}")"
+    fi
   fi
-
-  detected_kind_version="${MKCLUSTER_KIND_VERSION:-}"
-  if [[ -z "${detected_kind_version}" ]]; then
-    detected_kind_version="$(detect_latest_kind_version "${KIND_LATEST_RELEASE_JSON}" || true)"
+  if [[ "${kubernetes_version}" == latest ]]; then
+    local image_version
+    image_version="$(kind_node_image_k8s_version "${kind_node_image}")"
+    [[ -z "${image_version}" ]] || kubernetes_version="${image_version}"
   fi
-  KIND_VERSION="${detected_kind_version:-${FALLBACK_KIND_VERSION}}"
-
-  DEFAULT_KIND_NODE_IMAGE="${MKCLUSTER_KIND_NODE_IMAGE:-}"
-  if [[ -z "${DEFAULT_KIND_NODE_IMAGE}" && -n "${KIND_LATEST_RELEASE_JSON}" ]]; then
-    DEFAULT_KIND_NODE_IMAGE="$(detect_latest_kind_node_image "${KIND_LATEST_RELEASE_JSON}" || true)"
+  if [[ -z "${KIND_VERSION}" ]]; then
+    if command -v kind >/dev/null 2>&1; then
+      KIND_VERSION="$(kind version | awk '{print $2}')"
+    else
+      KIND_VERSION="$(kind_release_tag_from_json "${KIND_LATEST_RELEASE_JSON}")"
+    fi
   fi
-
-  detected_k8s_version="${MKCLUSTER_K8S_VERSION:-${MKCLUSTER_KUBERNETES_VERSION:-}}"
-  if [[ -z "${detected_k8s_version}" ]]; then
-    detected_k8s_version="$(kind_node_image_k8s_version "${DEFAULT_KIND_NODE_IMAGE}" || true)"
+  if [[ "${gpu_enabled}" == true && -z "${NVIDIA_DRA_DRIVER_CHART_VERSION}" ]]; then
+    [[ "${gpu_detected}" == true ]] || die "NVIDIA version resolution requires a detected GPU."
+    NVIDIA_DRA_DRIVER_CHART_VERSION="$(detect_latest_nvidia_dra_driver_chart_version || true)"
+    [[ -n "${NVIDIA_DRA_DRIVER_CHART_VERSION}" ]] || die "Cannot resolve NVIDIA chart version; set MKCLUSTER_NVIDIA_DRA_DRIVER_CHART_VERSION."
   fi
-  DEFAULT_KUBERNETES_VERSION="${detected_k8s_version:-latest}"
-
-  detected_dra_chart_version="${MKCLUSTER_NVIDIA_DRA_DRIVER_CHART_VERSION:-}"
-  if [[ -z "${detected_dra_chart_version}" ]]; then
-    detected_dra_chart_version="$(detect_latest_nvidia_dra_driver_chart_version || true)"
-  fi
-  NVIDIA_DRA_DRIVER_CHART_VERSION="${detected_dra_chart_version:-${FALLBACK_NVIDIA_DRA_DRIVER_CHART_VERSION}}"
 }
 
 function prescan_action() {
+  # Help is deliberately entirely local, including when a profile is supplied.
+  local arg
+  for arg in "$@"; do
+    [[ "${arg}" != -- ]] || break
+    if [[ "${arg}" == --help || "${arg}" == -h ]]; then
+      initialize_defaults
+      usage
+      exit 0
+    fi
+  done
   while (($#)); do
     case "$1" in
-      --repair-gpu-mounts)
-        action='repair_gpu_mounts'
-        ;;
-      --)
-        break
-        ;;
+      --profile)
+        require_arg "$1" "${2:-}"
+        [[ -z "${profile_path}" ]] || die "Use only one --profile."
+        profile_path="$2"; shift ;;
+      --profile=*)
+        require_arg --profile "${1#*=}"
+        [[ -z "${profile_path}" ]] || die "Use only one --profile."
+        profile_path="${1#*=}" ;;
+      --) break ;;
     esac
     shift
   done
+  [[ -z "${profile_path}" ]] || load_profile "${profile_path}"
 }
 
 function parse_args() {
   while (($#)); do
     case "$1" in
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      -l|--latest-kind-version)
-        print_latest_kind_version
-        exit 0
-        ;;
-      -L|--latest-versions)
-        print_latest_versions
-        exit 0
-        ;;
-      --repair-gpu-mounts)
-        action='repair_gpu_mounts'
-        shift
-        ;;
-      -g|--gpu)
-        gpu_enabled=true
-        shift
-        ;;
-      -d|--gpu-dra)
-        gpu_dra_enabled=true
-        shift
-        ;;
-      -n|--name)
-        require_arg "$1" "${2:-}"
-        cluster_name="$2"
-        shift 2
-        ;;
-      --name=*)
-        cluster_name="${1#*=}"
-        shift
-        ;;
-      -i|--ip-family)
-        require_arg "$1" "${2:-}"
-        ip_family="$2"
-        shift 2
-        ;;
-      --ip-family=*)
-        ip_family="${1#*=}"
-        shift
-        ;;
-      -P|--provider)
-        require_arg "$1" "${2:-}"
-        provider="$2"
-        shift 2
-        ;;
-      --provider=*)
-        provider="${1#*=}"
-        shift
-        ;;
-      -k|--k8s-version)
-        require_arg "$1" "${2:-}"
-        kubernetes_version="$2"
-        shift 2
-        ;;
-      --k8s-version=*)
-        kubernetes_version="${1#*=}"
-        shift
-        ;;
-      -a|--api-server-address)
-        require_arg "$1" "${2:-}"
-        api_server_address="$2"
-        shift 2
-        ;;
-      --api-server-address=*)
-        api_server_address="${1#*=}"
-        shift
-        ;;
-      -p|--api-server-port)
-        require_arg "$1" "${2:-}"
-        api_server_port="$2"
-        shift 2
-        ;;
-      --api-server-port=*)
-        api_server_port="${1#*=}"
-        shift
-        ;;
-      -W|--workers)
-        require_arg "$1" "${2:-}"
-        worker_count="$2"
-        shift 2
-        ;;
-      --workers=*)
-        worker_count="${1#*=}"
-        shift
-        ;;
-      -f|--feature-gate)
-        require_arg "$1" "${2:-}"
-        feature_gates+=("$2")
-        shift 2
-        ;;
-      --feature-gate=*)
-        feature_gates+=("${1#*=}")
-        shift
-        ;;
-      -r|--retain)
-        kind_extra_args+=(--retain)
-        shift
-        ;;
-      -w|--wait)
-        require_arg "$1" "${2:-}"
-        kind_extra_args+=(--wait "$2")
-        shift 2
-        ;;
-      --wait=*)
-        kind_extra_args+=(--wait "${1#*=}")
-        shift
-        ;;
+      -h|--help) usage; exit 0 ;;
+      -l|--latest-kind-version) print_latest_kind_version; exit 0 ;;
+      -L|--latest-versions) print_latest_versions; exit 0 ;;
+      --dry-run|--doctor|--repair-gpu-mounts)
+        [[ "${action}" == create ]] || die "Choose one action only."
+        action="${1#--}"
+        [[ "${action}" != repair-gpu-mounts ]] || action=repair_gpu_mounts
+        shift ;;
+      --resume) resume_enabled=true; shift ;;
+      -g|--gpu) gpu_enabled=true; shift ;;
+      -d|--gpu-dra) gpu_dra_enabled=true; shift ;;
+      -r|--retain) kind_extra_args+=(--retain); shift ;;
       --)
         shift
-        kind_extra_args+=("$@")
-        break
-        ;;
-      *)
-        die "Unknown argument: $1. Pass through extra kind arguments after --"
-        ;;
+        parse_kind_args "$@"
+        break ;;
+      --*=*)
+        set_option "${1%%=*}" "${1#*=}"
+        shift ;;
+      --profile|--write-lock|--kubeconfig|--http-port|--https-port|--registry-name|--registry-port|--node-image|\
+      -n|--name|-i|--ip-family|-P|--provider|-k|--k8s-version|-a|--api-server-address|-p|--api-server-port|-W|--workers|-f|--feature-gate|-w|--wait)
+        set_option "$1" "${2:-}"
+        shift 2 ;;
+      *) die "Unknown argument: $1. Pass through extra kind arguments after --" ;;
     esac
   done
 }
@@ -818,8 +775,6 @@ function validate_args() {
   [[ -n "${registry_name}" ]] || die "Registry name cannot be empty"
 
   validate_positive_int "worker count" "${worker_count}"
-  validate_positive_int "registry port" "${registry_port}"
-  validate_positive_int "api server port" "${api_server_port}"
   case "${ip_family}" in
     ipv4|ipv6|dual) ;;
     *) die "ip family must be one of: ipv4, ipv6, dual" ;;
@@ -828,12 +783,36 @@ function validate_args() {
     docker|nerdctl|podman) ;;
     *) die "provider must be one of: docker, nerdctl, podman" ;;
   esac
-  kind_node_image="$(resolve_kind_node_image "${kubernetes_version}")"
-
-  if [[ "${gpu_dra_enabled}" == true ]]; then
+  validate_port "registry port" "${registry_port}"
+  validate_port "api server port" "${api_server_port}"
+  validate_port "HTTP port" "${http_port}"
+  validate_port "HTTPS port" "${https_port}"
+  [[ "${readiness_timeout}" =~ ^[1-9][0-9]*(s|m|h)$ ]] || die "Wait must be a positive duration such as 30s, 5m, or 1h."
+  [[ "${cluster_name}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "Cluster name must contain lowercase letters, digits, or internal hyphens."
+  [[ "${registry_name}" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die "Invalid registry name."
+  [[ "${api_server_address}" =~ ^[a-fA-F0-9:.]+$ ]] || die "API server address must be an IPv4 or IPv6 literal."
+  [[ -z "${KIND_VERSION}" || "${KIND_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Kind version must be a release tag such as v0.31.0."
+  if [[ "${node_image_explicit}" == true && "${kubernetes_version_explicit}" == true && "${kubernetes_version#v}" != latest ]]; then
+    local image_version requested_version="${kubernetes_version#v}"
+    image_version="$(kind_node_image_k8s_version "${kind_node_image}")"
+    [[ -n "${image_version}" ]] || die "Cannot verify --k8s-version against this custom image; use --node-image alone."
+    if [[ "${image_version}" != "${requested_version}" ]]; then
+      [[ "${requested_version}" =~ ^[0-9]+\.[0-9]+$ && "${image_version}" == "${requested_version}."* ]] || die "--node-image version ${image_version} conflicts with --k8s-version ${requested_version}."
+    fi
+  fi
+  local gate value
+  local -a inherited_gates=("${feature_gates[@]}")
+  feature_gates=()
+  for gate in "${inherited_gates[@]}"; do set_feature_gate "${gate}"; done
+  for value in "${kind_node_image}" "${kubeconfig_path}" "${NVIDIA_DRA_DRIVER_ROOT}" "${NVIDIA_DRA_DRIVER_CHART_VERSION}"; do
+    [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || die "Settings must not contain line breaks."
+  done
+  for gate in "${feature_gates[@]}"; do normalize_feature_gate "${gate}" >/dev/null; done
+  if is_true "${gpu_dra_enabled}"; then
+    gpu_dra_enabled=true
     gpu_enabled=true
-    ensure_feature_gate_default "DRAPartitionableDevices"
-    ensure_feature_gate_default "DRAConsumableCapacity"
+    enable_dra_gate "DRAPartitionableDevices"
+    enable_dra_gate "DRAConsumableCapacity"
   fi
 
   if ! is_true "${gpu_enabled}"; then
@@ -844,26 +823,51 @@ function validate_args() {
 }
 
 function check_deps() {
-  if [[ $OSTYPE =~ ^darwin ]]; then
-    command -v kind &>/dev/null || brew install kind
-    command -v kubectl &>/dev/null || brew install kubectl
-  elif [[ $OSTYPE =~ ^linux ]]; then
-    command -v kind &>/dev/null || go install "sigs.k8s.io/kind@${KIND_VERSION}" || warn "Install kind from your package manager"
-    if ! command -v kubectl &>/dev/null; then
-      curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" &&
-      sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-    fi
+  local dependency
+  for dependency in kind kubectl; do
+    command -v "${dependency}" &>/dev/null ||
+      die "Missing prerequisite: ${dependency}. Install it for your host OS/architecture using your package manager or its official installation guide, then retry."
+  done
+  if [[ -n "${KIND_VERSION:-}" ]]; then
+    local version_output binary_name installed_version
+    version_output="$(kind version)" || die "Could not read the installed kind version."
+    read -r binary_name installed_version _ <<<"${version_output}"
+    [[ "${binary_name}" == kind && "${installed_version}" == "${KIND_VERSION}" ]] ||
+      die "This profile requires kind ${KIND_VERSION}; installed version is ${installed_version:-unknown}. Install the pinned kind version before retrying."
   fi
+}
+
+function kind_cmd() {
+  KIND_EXPERIMENTAL_PROVIDER="${provider}" kind "$@"
+}
+
+function kubectl_cmd() {
+  local -a connection_args=(--context "kind-${cluster_name}")
+  if [[ -n "${kubeconfig_path:-}" ]]; then
+    connection_args+=(--kubeconfig "${kubeconfig_path}")
+  fi
+  kubectl "${connection_args[@]}" "$@"
+}
+
+function helm_cmd() {
+  local -a connection_args=(--kube-context "kind-${cluster_name}")
+  if [[ -n "${kubeconfig_path:-}" ]]; then
+    connection_args+=(--kubeconfig "${kubeconfig_path}")
+  fi
+  helm "${connection_args[@]}" "$@"
 }
 
 function detect_container_cli() {
   if [[ -n "${CONTAINER_CLI:-}" ]]; then
-    echo "${CONTAINER_CLI}"
+    [[ "${CONTAINER_CLI##*/}" == "${provider}" ]] ||
+      die "CONTAINER_CLI must name the selected provider '${provider}' so kind and container operations use the same engine."
+    command -v "${CONTAINER_CLI}" &>/dev/null || die "CONTAINER_CLI is not executable: ${CONTAINER_CLI}"
+    printf '%s\n' "${CONTAINER_CLI}"
     return
   fi
 
   command -v "${provider}" &>/dev/null || die "Selected provider '${provider}' is not installed or not on PATH."
-  echo "${provider}"
+  printf '%s\n' "${provider}"
 }
 
 function linux_preflight() {
@@ -883,46 +887,6 @@ To persist:
 EOF
     exit 1
   fi
-}
-
-function config_section_has_setting() {
-  local file_path="$1"
-  local section_name="$2"
-  local setting_name="$3"
-  local expected_value="$4"
-
-  [[ -f "${file_path}" ]] || return 1
-
-  awk \
-    -v section_name="${section_name}" \
-    -v setting_name="${setting_name}" \
-    -v expected_value="${expected_value}" '
-      function trim(value) {
-        sub(/^[[:space:]]+/, "", value)
-        sub(/[[:space:]]+$/, "", value)
-        return value
-      }
-
-      /^[[:space:]]*#/ { next }
-      /^[[:space:]]*;/ { next }
-      /^[[:space:]]*\[/ {
-        in_section = ($0 == "[" section_name "]")
-        next
-      }
-      !in_section { next }
-      $0 ~ "^[[:space:]]*" setting_name "[[:space:]]*=" {
-        split($0, parts, "=")
-        value = trim(parts[2])
-        gsub(/"/, "", value)
-        if (value == expected_value) {
-          found = 1
-          exit
-        }
-      }
-      END {
-        exit(found ? 0 : 1)
-      }
-    ' "${file_path}"
 }
 
 function config_root_has_setting() {
@@ -963,21 +927,55 @@ function config_root_has_setting() {
     ' "${file_path}"
 }
 
-function require_gpu_host_prereqs() {
+function detect_gpu_hardware() {
+  gpu_detected=false
+  gpu_count=0
   [[ $OSTYPE =~ ^linux ]] || die "GPU clusters are only validated on Linux hosts."
-
   command -v nvidia-smi &>/dev/null || die "GPU support requires nvidia-smi on the host."
-  nvidia-smi -L &>/dev/null || die "nvidia-smi could not enumerate any GPUs."
-  command -v nvidia-container-runtime &>/dev/null || die "GPU support requires nvidia-container-runtime on the host."
+  local gpu_uuids uuid
+  gpu_uuids="$(nvidia-smi --query-gpu=uuid --format=csv,noheader)" ||
+    die "NVIDIA GPU detection failed. Check the host driver with nvidia-smi before enabling GPU support."
+  while IFS= read -r uuid; do
+    uuid="${uuid//$'\r'/}"
+    [[ -n "${uuid}" ]] || continue
+    [[ "${uuid}" =~ ^GPU-[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] ||
+      die "NVIDIA GPU detection returned an invalid GPU UUID; refusing NVIDIA configuration."
+    ((gpu_count += 1))
+  done <<<"${gpu_uuids}"
+  ((gpu_count > 0)) || die "No NVIDIA GPU was detected; refusing NVIDIA configuration. Run without --gpu for a CPU cluster."
+  gpu_detected=true
+  info "Detected ${gpu_count} NVIDIA GPU(s)." >&2
+}
 
-  [[ -e /dev/nvidiactl ]] || die "GPU support requires /dev/nvidiactl on the host."
-  compgen -G '/dev/nvidia[0-9]*' >/dev/null || die "GPU support requires at least one /dev/nvidia<N> device on the host."
+function require_detected_gpu() {
+  [[ "${gpu_detected:-false}" == true ]] ||
+    die "NVIDIA configuration requires successful host GPU detection first."
+}
+
+function require_gpu_host_prereqs() {
+  require_detected_gpu
+  command -v nvidia-container-runtime &>/dev/null || die "GPU support requires nvidia-container-runtime on the host."
+  command -v ldconfig &>/dev/null || die "GPU support requires ldconfig on the host."
+  command -v readlink &>/dev/null || die "GPU support requires readlink on the host."
+
+  require_gpu_device_nodes
 
   local runtime_config='/etc/nvidia-container-runtime/config.toml'
   [[ -f "${runtime_config}" ]] || die "GPU support requires ${runtime_config}."
 
   config_root_has_setting "${runtime_config}" "accept-nvidia-visible-devices-as-volume-mounts" "true" ||
     die "${runtime_config} must set accept-nvidia-visible-devices-as-volume-mounts = true for this kind GPU workflow."
+}
+
+function require_gpu_device_nodes() {
+  [[ -c /dev/nvidiactl ]] || die "GPU support requires the /dev/nvidiactl character device on the host."
+  local device
+  for device in /dev/nvidia[0-9]*; do
+    if [[ "${device}" =~ ^/dev/nvidia[0-9]+$ && -c "${device}" ]]; then
+      return
+    fi
+  done
+  die "GPU support requires at least one /dev/nvidia<N> character device on the host."
 }
 
 function append_gpu_mount() {
@@ -991,12 +989,12 @@ function append_gpu_mount_if_present() {
   local host_path="$1"
   local container_path="$2"
 
-  [[ -n "${host_path}" && -e "${host_path}" ]] || return
+  [[ -n "${host_path}" && -e "${host_path}" ]] || return 0
   append_gpu_mount "${host_path}" "${container_path}"
 }
 
 function detect_gpu_node_library_dir() {
-  case "$(uname -m)" in
+  case "${1:-$(uname -m)}" in
     x86_64|amd64)
       printf '%s\n' '/usr/lib/x86_64-linux-gnu'
       ;;
@@ -1004,26 +1002,34 @@ function detect_gpu_node_library_dir() {
       printf '%s\n' '/usr/lib/aarch64-linux-gnu'
       ;;
     *)
-      printf '%s\n' '/usr/lib64'
+      die "GPU library mounts are supported only on x86_64 and aarch64 hosts."
       ;;
   esac
 }
 
 function detect_gpu_mounts() {
+  require_detected_gpu
   gpu_mounts=()
 
   local nvidia_smi_path
-  local libnvidia_ml_soname_path libnvidia_ml_real_path
-  local libcuda_soname_path libcuda_real_path
+  local libnvidia_ml_soname_path libnvidia_ml_real_path=''
+  local libcuda_soname_path libcuda_real_path=''
   local ldconfig_output
-  local node_library_dir
+  local node_library_dir library_abi architecture
+  architecture="$(uname -m)"
   nvidia_smi_path="$(readlink -f "$(command -v nvidia-smi)")"
-  ldconfig_output="$(ldconfig -p 2>/dev/null || true)"
-  libnvidia_ml_soname_path="$(awk '/libnvidia-ml\.so\.1 \(libc6,x86-64\)/ {print $NF; exit}' <<<"${ldconfig_output}")"
-  libcuda_soname_path="$(awk '/libcuda\.so\.1 \(libc6,x86-64\)/ {print $NF; exit}' <<<"${ldconfig_output}")"
+  ldconfig_output="$(ldconfig -p)" || die "Could not read the host library cache with ldconfig -p."
+  case "${architecture}" in
+    x86_64|amd64) library_abi='x86-64' ;;
+    aarch64|arm64) library_abi='AArch64' ;;
+    *) die "GPU library mounts are supported only on x86_64 and aarch64 hosts." ;;
+  esac
+  # Ignore 32-bit compatibility libraries in a mixed-ABI host cache.
+  libnvidia_ml_soname_path="$(awk -v abi="${library_abi}" '$1 == "libnvidia-ml.so.1" && index($0, abi) && $NF ~ /^\// {print $NF; exit}' <<<"${ldconfig_output}")"
+  libcuda_soname_path="$(awk -v abi="${library_abi}" '$1 == "libcuda.so.1" && index($0, abi) && $NF ~ /^\// {print $NF; exit}' <<<"${ldconfig_output}")"
   [[ -n "${libnvidia_ml_soname_path}" ]] && libnvidia_ml_real_path="$(readlink -f "${libnvidia_ml_soname_path}")"
   [[ -n "${libcuda_soname_path}" ]] && libcuda_real_path="$(readlink -f "${libcuda_soname_path}")"
-  node_library_dir="$(detect_gpu_node_library_dir)"
+  node_library_dir="$(detect_gpu_node_library_dir "${architecture}")"
 
   [[ -n "${nvidia_smi_path}" && -f "${nvidia_smi_path}" ]] || die "Could not resolve the host path for nvidia-smi."
   [[ -n "${libnvidia_ml_soname_path}" && -e "${libnvidia_ml_soname_path}" ]] || die "Could not resolve the host path for libnvidia-ml.so.1."
@@ -1031,12 +1037,13 @@ function detect_gpu_mounts() {
 
   append_gpu_mount "${nvidia_smi_path}" "/usr/bin/nvidia-smi"
   append_gpu_mount "${libnvidia_ml_soname_path}" "${node_library_dir}/libnvidia-ml.so.1"
-  append_gpu_mount_if_present "${libnvidia_ml_real_path}" "${node_library_dir}/$(basename "${libnvidia_ml_real_path}")"
+  append_gpu_mount_if_present "${libnvidia_ml_real_path}" "${node_library_dir}/${libnvidia_ml_real_path##*/}"
   append_gpu_mount "${libcuda_soname_path}" "${node_library_dir}/libcuda.so.1"
-  append_gpu_mount_if_present "${libcuda_real_path}" "${node_library_dir}/$(basename "${libcuda_real_path}")"
+  append_gpu_mount_if_present "${libcuda_real_path}" "${node_library_dir}/${libcuda_real_path##*/}"
 }
 
 function require_gpu_repair_prereqs() {
+  require_detected_gpu
   [[ $OSTYPE =~ ^linux ]] || die "GPU mount repair is only implemented on Linux hosts."
 
   command -v kind &>/dev/null || die "GPU mount repair requires kind on the host."
@@ -1044,16 +1051,17 @@ function require_gpu_repair_prereqs() {
   command -v nvidia-smi &>/dev/null || die "GPU mount repair requires nvidia-smi on the host."
   command -v ldconfig &>/dev/null || die "GPU mount repair requires ldconfig on the host."
   command -v readlink &>/dev/null || die "GPU mount repair requires readlink on the host."
-  nvidia-smi -L &>/dev/null || die "nvidia-smi could not enumerate any GPUs."
+  require_gpu_device_nodes
 }
 
 function is_worker_node_container() {
   local node="$1"
 
-  [[ "${node}" != *control-plane* ]]
+  [[ "${node}" != *-control-plane && ! "${node}" =~ -control-plane[0-9]+$ ]]
 }
 
 function repair_gpu_mount_file() {
+  require_detected_gpu
   local node="$1"
   local host_path="$2"
   local container_path="$3"
@@ -1072,6 +1080,7 @@ function repair_gpu_mount_file() {
 }
 
 function repair_worker_gpu_mounts() {
+  require_detected_gpu
   local node=''
   local gpu_mount=''
   local host_path=''
@@ -1091,30 +1100,11 @@ function repair_worker_gpu_mounts() {
 }
 
 function restart_nvidia_dra_pods() {
-  local context="kind-${cluster_name}"
+  require_detected_gpu
   local daemonset_name="${NVIDIA_DRA_DRIVER_RELEASE}-kubelet-plugin"
-  local -a pods=()
-
-  if ! kubectl --context "${context}" get namespace "${NVIDIA_DRA_DRIVER_NAMESPACE}" >/dev/null 2>&1; then
-    warn "Namespace ${NVIDIA_DRA_DRIVER_NAMESPACE} was not found; skipping DRA pod restart."
-    return
-  fi
-
-  mapfile -t pods < <(
-    kubectl --context "${context}" -n "${NVIDIA_DRA_DRIVER_NAMESPACE}" get pods -o name 2>/dev/null |
-      grep "^pod/${daemonset_name}-" || true
-  )
-
-  if (( ${#pods[@]} == 0 )); then
-    warn "No ${daemonset_name} pods found to restart."
-  else
-    kubectl --context "${context}" -n "${NVIDIA_DRA_DRIVER_NAMESPACE}" delete "${pods[@]}" --wait=false
-  fi
-
-  if kubectl --context "${context}" -n "${NVIDIA_DRA_DRIVER_NAMESPACE}" get daemonset "${daemonset_name}" >/dev/null 2>&1; then
-    kubectl --context "${context}" -n "${NVIDIA_DRA_DRIVER_NAMESPACE}" rollout status "daemonset/${daemonset_name}" --timeout=2m ||
-      warn "Timed out waiting for ${daemonset_name} rollout; check pod logs for remaining DRA issues."
-  fi
+  kubectl_cmd -n "${NVIDIA_DRA_DRIVER_NAMESPACE}" rollout restart "daemonset/${daemonset_name}" ||
+    die "Could not restart ${daemonset_name}; check the selected cluster and NVIDIA DRA installation."
+  verify_nvidia_ready
 }
 
 function repair_gpu_mounts() {
@@ -1128,11 +1118,14 @@ function repair_gpu_mounts() {
 }
 
 function require_gpu_provider_prereqs() {
-  case "${container_cli}" in
+  require_detected_gpu
+  case "${provider}" in
     docker)
-      command -v docker &>/dev/null || die "GPU support with docker requires the docker CLI."
-      docker info &>/dev/null || die "docker info failed; the Docker daemon must be reachable for GPU clusters."
-      [[ "$(docker info --format '{{.DefaultRuntime}}' 2>/dev/null)" == "nvidia" ]] ||
+      "${container_cli}" info &>/dev/null || die "docker info failed; the Docker daemon must be reachable for GPU clusters."
+      local default_runtime
+      default_runtime="$("${container_cli}" info --format '{{.DefaultRuntime}}')" ||
+        die "Could not inspect Docker's default runtime."
+      [[ "${default_runtime}" == nvidia ]] ||
         die "Docker must use the nvidia default runtime for kind GPU nodes."
       ;;
     nerdctl)
@@ -1169,7 +1162,7 @@ function gpu_preflight() {
 }
 
 function ensure_podman_kind_network() {
-  if [[ "${container_cli}" != "podman" ]]; then
+  if [[ "${provider}" != "podman" ]]; then
     return
   fi
 
@@ -1177,47 +1170,71 @@ function ensure_podman_kind_network() {
     return
   fi
 
-  local cluster_network
-  cluster_network="$("${container_cli}" network inspect "${cluster_name}" 2>/dev/null || true)"
-
-  if [[ -z "${cluster_network}" ]]; then
-    "${container_cli}" network create "${cluster_name}" >/dev/null
+  local network_name="${KIND_EXPERIMENTAL_PODMAN_NETWORK:-kind}"
+  local networks name network_exists=false cluster_network
+  networks="$("${container_cli}" network ls --format '{{.Name}}')" || die "Could not list Podman networks."
+  while IFS= read -r name; do
+    [[ "${name}" != "${network_name}" ]] || network_exists=true
+  done <<<"${networks}"
+  if [[ "${network_exists}" == false ]]; then
+    "${container_cli}" network create "${network_name}" >/dev/null || die "Could not create Podman network ${network_name}."
     return
   fi
-
-  if grep -q '"ipv6_enabled": true' <<<"${cluster_network}"; then
-    if ! grep -q '"containers": {}' <<<"${cluster_network}"; then
-      cat >&2 <<EOF
-The existing podman network "${cluster_name}" has IPv6 enabled, but this kernel boots with IPv6 disabled.
-Remove the existing cluster/network, or recreate the network without IPv6, then rerun mkcluster.
-EOF
-      exit 1
-    fi
-
-    "${container_cli}" network rm "${cluster_name}" >/dev/null
-    "${container_cli}" network create "${cluster_name}" >/dev/null
+  cluster_network="$("${container_cli}" network inspect "${network_name}")" || die "Could not inspect Podman network ${network_name}."
+  if grep -Eq '"ipv6_enabled"[[:space:]]*:[[:space:]]*true' <<<"${cluster_network}"; then
+    die "Podman network ${network_name} has IPv6 enabled on a host with IPv6 disabled. Select another network or recreate it explicitly before retrying."
   fi
 }
 
+function inspect_port_bindings() {
+  local container_name="$1" container_port="$2" address_field=HostIp
+  # Podman's Go field differs from its Docker-compatible JSON key.
+  [[ "${provider}" != podman ]] || address_field=HostIP
+  "${container_cli}" inspect -f "{{range (index .HostConfig.PortBindings \"${container_port}/tcp\")}}{{.${address_field}}}:{{.HostPort}}{{\"\\n\"}}{{end}}" "${container_name}"
+}
+
 function ensure_registry() {
-  if [ "$("${container_cli}" inspect -f '{{.State.Running}}' "${registry_name}" 2>/dev/null || true)" != 'true' ]; then
+  local names name registry_exists=false bindings running
+  names="$("${container_cli}" ps -a --format '{{.Names}}')" ||
+    die "Could not list containers with ${container_cli}; check the selected provider connection."
+  while IFS= read -r name; do
+    if [[ "${name}" == "${registry_name}" ]]; then
+      registry_exists=true
+    fi
+  done <<<"${names}"
+  if [[ "${registry_exists}" == false ]]; then
     "${container_cli}" run \
       -d \
       --restart=always \
       -p "127.0.0.1:${registry_port}:5000" \
       --name "${registry_name}" \
-      registry:2
+      registry:2 || die "Could not create registry ${registry_name}."
+    return
   fi
+  bindings="$(inspect_port_bindings "${registry_name}" 5000)" ||
+    die "Could not inspect registry ${registry_name}."
+  [[ "${bindings}" == "127.0.0.1:${registry_port}" ]] ||
+    die "Registry ${registry_name} must bind 127.0.0.1:${registry_port} to container port 5000. Existing binding: ${bindings:-none}. Select its port or another registry name."
+  running="$("${container_cli}" inspect -f '{{.State.Running}}' "${registry_name}")" ||
+    die "Could not inspect registry ${registry_name} state."
+  case "${running}" in
+    true) ;;
+    false) "${container_cli}" start "${registry_name}" || die "Could not restart registry ${registry_name}." ;;
+    *) die "Unknown state for registry ${registry_name}: ${running}" ;;
+  esac
 }
 
 function emit_kind_config() {
+  if [[ "${gpu_enabled}" == true ]]; then
+    require_detected_gpu
+  fi
   cat <<EOF
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 EOF
 
   if (( ${#feature_gates[@]} > 0 )); then
-    echo "featureGates:"
+    printf '%s\n' 'featureGates:'
     local gate
     for gate in "${feature_gates[@]}"; do
       printf '  %s\n' "$(normalize_feature_gate "${gate}")"
@@ -1238,15 +1255,21 @@ nodes:
       ingress-ready: "true"
     extraPortMappings:
       - containerPort: 80
-        hostPort: 80
+        hostPort: ${http_port}
       - containerPort: 443
-        hostPort: 443
+        hostPort: ${https_port}
 EOF
+  if [[ -n "${kind_node_image}" ]]; then
+    printf '    image: %s\n' "$(yaml_quote "${kind_node_image}")"
+  fi
 
   local gpu_mount host_path container_path
   local worker_index
   for ((worker_index = 0; worker_index < worker_count; worker_index++)); do
-    echo "  - role: worker"
+    printf '%s\n' '  - role: worker'
+    if [[ -n "${kind_node_image}" ]]; then
+      printf '    image: %s\n' "$(yaml_quote "${kind_node_image}")"
+    fi
     if [[ "${gpu_enabled}" == true ]]; then
       cat <<EOF
     labels:
@@ -1260,8 +1283,8 @@ EOF
       for gpu_mount in "${gpu_mounts[@]}"; do
         IFS='|' read -r host_path container_path <<<"${gpu_mount}"
         cat <<EOF
-      - hostPath: ${host_path}
-        containerPath: ${container_path}
+      - hostPath: $(yaml_quote "${host_path}")
+        containerPath: $(yaml_quote "${container_path}")
         readOnly: true
         selinuxRelabel: false
         propagation: None
@@ -1271,27 +1294,173 @@ EOF
   done
 }
 
+function yaml_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '"%s"' "${value}"
+}
+
+function check_cluster_state() {
+  local clusters name
+  cluster_exists=false
+  clusters="$(kind_cmd get clusters)" || die "Could not list kind clusters for provider ${provider}."
+  while IFS= read -r name; do
+    if [[ "${name}" == "${cluster_name}" ]]; then
+      cluster_exists=true
+    fi
+  done <<<"${clusters}"
+  if [[ "${cluster_exists}" == true && "${resume_enabled:-false}" != true ]]; then
+    die "Cluster ${cluster_name} already exists. Rerun with --resume to finish configuring it."
+  fi
+  if [[ "${cluster_exists}" == false && "${resume_enabled:-false}" == true ]]; then
+    die "Cluster ${cluster_name} does not exist for ${provider}. Omit --resume to create it."
+  fi
+}
+
+function validate_resume_gpu_mounts() {
+  local node="$1" mounts mount_source mount_destination requested expected_source expected_destination
+  local matched smi_present=false actual_source resolved_source
+  mounts="$("${container_cli}" inspect -f '{{range .Mounts}}{{.Source}}{{"|"}}{{.Destination}}{{"\n"}}{{end}}' "${node}")" ||
+    die "Cannot inspect GPU mounts for ${node}; no resume changes were made."
+  for requested in "${gpu_mounts[@]}"; do
+    IFS='|' read -r expected_source expected_destination <<<"${requested}"
+    matched=false
+    resolved_source="$(readlink -f "${expected_source}")" || die "Cannot resolve GPU mount source ${expected_source}."
+    while IFS='|' read -r mount_source mount_destination; do
+      [[ "${mount_destination}" == "${expected_destination}" ]] || continue
+      actual_source="$(readlink -f "${mount_source}")" || continue
+      if [[ -n "${resolved_source}" && "${actual_source}" == "${resolved_source}" ]]; then
+        matched=true
+        [[ "${expected_destination}" != /usr/bin/nvidia-smi ]] || smi_present=true
+        break
+      fi
+    done <<<"${mounts}"
+    [[ "${matched}" == true ]] ||
+      die "Cannot resume GPU setup: ${node} lacks the requested mount ${expected_source} -> ${expected_destination}. Resume with the original GPU settings or create a new GPU cluster."
+  done
+  [[ "${smi_present}" == true ]] ||
+    die "Cannot resume GPU setup: ${node} has no verified NVIDIA binary mount. A CPU cluster cannot be converted with --resume --gpu."
+}
+
+function validate_resume_port() {
+  local node="$1" container_port="$2" expected_address="$3" expected_port="$4" bindings
+  bindings="$(inspect_port_bindings "${node}" "${container_port}")" ||
+    die "Cannot inspect port ${container_port} on ${node}; no resume changes were made."
+  # Docker may encode an IPv4 wildcard as an empty HostIp.
+  if [[ "${expected_address}" == 0.0.0.0 && "${bindings}" == ":${expected_port}" ]]; then
+    return
+  fi
+  [[ "${bindings}" == "${expected_address}:${expected_port}" ]] ||
+    die "Cannot resume ${node}: port ${container_port} is bound to ${bindings:-nothing}, expected ${expected_address}:${expected_port}. Use the original port settings or a new cluster name."
+}
+
+function validate_resume_cluster() {
+  [[ "${cluster_exists:-false}" == true ]] || return 0
+  load_kind_nodes
+  local node workers=0 control_planes=0 control_plane='' expected_image_id actual_image_id
+  local repo_digests='' repo_digests_loaded=false repo_digest target_digest image_matches
+  local ingress_address=0.0.0.0
+  for node in "${kind_nodes[@]}"; do
+    if is_worker_node_container "${node}"; then
+      ((workers += 1))
+      if [[ "${gpu_enabled}" == true ]]; then
+        require_detected_gpu
+        validate_resume_gpu_mounts "${node}"
+      fi
+    else
+      ((control_planes += 1))
+      control_plane="${node}"
+    fi
+  done
+  ((workers == worker_count && control_planes == 1)) ||
+    die "Cannot resume: cluster has ${workers} worker(s) and ${control_planes} control-plane node(s), but requested ${worker_count} worker(s) and one control plane. Use the original settings; --resume cannot change topology."
+  # kind defaults unspecified listeners to IPv4 for both IPv4 and dual-stack.
+  [[ "${ip_family}" != ipv6 ]] || ingress_address='::'
+  validate_resume_port "${control_plane}" 80 "${ingress_address}" "${http_port}"
+  validate_resume_port "${control_plane}" 443 "${ingress_address}" "${https_port}"
+  validate_resume_port "${control_plane}" 6443 "${api_server_address}" "${api_server_port}"
+  [[ -n "${kind_node_image}" ]] || die "Resume requires the original node image; supply its locked profile or --node-image."
+  expected_image_id="$("${container_cli}" image inspect -f '{{.Id}}' "${kind_node_image}")" ||
+    die "Cannot inspect the requested node image locally. Resume with the original locked image; no image was pulled."
+  expected_image_id="${expected_image_id#sha256:}"
+  [[ "${expected_image_id}" =~ ^[[:xdigit:]]{64}$ ]] ||
+    die "The provider did not return a usable image ID. Resume requires a locally verifiable original node image."
+  for node in "${kind_nodes[@]}"; do
+    actual_image_id="$("${container_cli}" inspect -f '{{.Image}}' "${node}")" || die "Cannot inspect node image for ${node}."
+    actual_image_id="${actual_image_id##*@sha256:}"
+    actual_image_id="${actual_image_id#sha256:}"
+    [[ "${actual_image_id}" =~ ^[[:xdigit:]]{64}$ ]] ||
+      die "Cannot verify the immutable node image for ${node}. Resume requires a locally verifiable original node image, not a mutable reference."
+    [[ "${actual_image_id}" != "${expected_image_id}" ]] || continue
+    # nerdctl reports the pinned manifest digest on containers, while image
+    # inspect .Id reports the config digest. Both identify this local image.
+    if [[ "${repo_digests_loaded}" == false ]]; then
+      repo_digests="$("${container_cli}" image inspect -f '{{range .RepoDigests}}{{.}}{{"\n"}}{{end}}' "${kind_node_image}")" ||
+        die "Cannot inspect immutable digests for the requested node image. Resume with the original locked image."
+      repo_digests_loaded=true
+    fi
+    image_matches=false
+    while IFS= read -r repo_digest; do
+      target_digest="${repo_digest##*@sha256:}"
+      target_digest="${target_digest#sha256:}"
+      if [[ "${target_digest}" =~ ^[[:xdigit:]]{64}$ && "${actual_image_id}" == "${target_digest}" ]]; then
+        image_matches=true
+        break
+      fi
+    done <<<"${repo_digests}"
+    [[ "${image_matches}" == true ]] ||
+      die "Cannot resume: ${node} does not use the requested node image. Resume with the original locked image; --resume cannot replace nodes."
+  done
+}
+
 function create_cluster() {
+  if [[ "${cluster_exists:-false}" == true ]]; then
+    [[ "${resume_enabled:-false}" == true ]] || die "Existing cluster requires --resume."
+    local -a export_args=(export kubeconfig --name "${cluster_name}")
+    if [[ -n "${kubeconfig_path:-}" ]]; then
+      export_args+=(--kubeconfig "${kubeconfig_path}")
+    fi
+    kind_cmd "${export_args[@]}" || die "Could not export kubeconfig for ${cluster_name}."
+    info "Resuming configuration of cluster ${cluster_name}."
+    return
+  fi
   local create_args=(create cluster --name "${cluster_name}")
   create_args+=("${kind_extra_args[@]}")
+  if [[ -n "${kubeconfig_path:-}" ]]; then
+    create_args+=(--kubeconfig "${kubeconfig_path}")
+  fi
   if [[ -n "${kind_node_image}" ]]; then
     create_args+=(--image "${kind_node_image}")
   fi
-  create_args+=(--config=-)
-  emit_kind_config | kind "${create_args[@]}"
+  create_args+=(--retain --wait "${readiness_timeout}" --config=-)
+  local config
+  config="$(emit_kind_config)" || die "Could not generate kind configuration."
+  kind_cmd "${create_args[@]}" <<<"${config}" ||
+    die "Cluster creation failed. Inspect kind's output; if the cluster exists, retry with --resume after fixing the cause."
 }
 
 function load_kind_nodes() {
-  mapfile -t kind_nodes < <(kind get nodes --name "${cluster_name}")
+  local nodes node
+  nodes="$(kind_cmd get nodes --name "${cluster_name}")" || die "Could not load nodes for cluster ${cluster_name}."
+  kind_nodes=()
+  while IFS= read -r node; do
+    [[ -n "${node}" ]] && kind_nodes+=("${node}")
+  done <<<"${nodes}"
   (( ${#kind_nodes[@]} > 0 )) || die "No nodes found for cluster ${cluster_name}"
 }
 
 function detect_cluster_network_name() {
   local first_node="${kind_nodes[0]}"
-  local network_name=''
+  local network_name='' networks
 
   # shellcheck disable=SC2016
-  network_name="$("${container_cli}" inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "${first_node}" 2>/dev/null | head -n1)"
+  networks="$("${container_cli}" inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "${first_node}")" ||
+    die "Could not inspect networks for node ${first_node}."
+  network_name="${networks%%$'\n'*}"
   [[ -n "${network_name}" ]] || die "Could not determine the container network for node ${first_node}"
 
   printf '%s\n' "${network_name}"
@@ -1299,9 +1468,13 @@ function detect_cluster_network_name() {
 
 function connect_registry_network() {
   cluster_network_name="$(detect_cluster_network_name)"
-
-  if [ "$("${container_cli}" inspect -f="{{json (index .NetworkSettings.Networks \"${cluster_network_name}\")}}" "${registry_name}" 2>/dev/null || true)" = 'null' ]; then
-    "${container_cli}" network connect "${cluster_network_name}" "${registry_name}"
+  local registry_network
+  registry_network="$("${container_cli}" inspect -f="{{json (index .NetworkSettings.Networks \"${cluster_network_name}\")}}" "${registry_name}")" ||
+    die "Could not inspect registry network membership."
+  [[ -n "${registry_network}" ]] || die "Registry network inspection returned an empty result."
+  if [[ "${registry_network}" == 'null' ]]; then
+    "${container_cli}" network connect "${cluster_network_name}" "${registry_name}" ||
+      die "Could not connect registry ${registry_name} to network ${cluster_network_name}."
   fi
 }
 
@@ -1321,12 +1494,12 @@ function annotate_registry() {
   local node
 
   for node in "${kind_nodes[@]}"; do
-    kubectl annotate --overwrite node "${node}" "kind.x-k8s.io/registry=localhost:${registry_port}"
+    kubectl_cmd annotate --overwrite node "${node}" "kind.x-k8s.io/registry=localhost:${registry_port}"
   done
 }
 
 function document_local_registry() {
-  cat <<EOF | kubectl apply -f -
+  cat <<EOF | kubectl_cmd apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -1343,51 +1516,275 @@ function install_nvidia_dra_driver() {
   if [[ "${gpu_enabled}" != true ]]; then
     return
   fi
+  require_detected_gpu
 
-  local values_file
-  values_file="$(mktemp)"
-  cat >"${values_file}" <<EOF
+  info "Installing NVIDIA DRA driver ${NVIDIA_DRA_DRIVER_CHART_VERSION} via Helm..."
+  helm_cmd repo add nvidia https://helm.ngc.nvidia.com/nvidia --force-update ||
+    die "Failed to configure the NVIDIA Helm repository."
+  helm_cmd repo update nvidia || die "Failed to update the NVIDIA Helm repository."
+  helm_cmd upgrade -i "${NVIDIA_DRA_DRIVER_RELEASE}" nvidia/nvidia-dra-driver-gpu \
+    --version "${NVIDIA_DRA_DRIVER_CHART_VERSION}" \
+    --namespace "${NVIDIA_DRA_DRIVER_NAMESPACE}" \
+    --create-namespace \
+    --wait --timeout "${readiness_timeout}" \
+    --set gpuResourcesEnabledOverride=true \
+    --set-string nvidiaDriverRoot="${NVIDIA_DRA_DRIVER_ROOT}" \
+    -f - <<EOF || die "Failed to install the NVIDIA DRA driver Helm chart. Fix the reported error and rerun with --resume."
 image:
   pullPolicy: IfNotPresent
 kubeletPlugin:
   nodeSelector:
     nvidia.com/dra-kubelet-plugin: "true"
 EOF
-
-  info "Installing NVIDIA DRA driver ${NVIDIA_DRA_DRIVER_CHART_VERSION} via Helm..."
-  helm repo add nvidia https://helm.ngc.nvidia.com/nvidia >/dev/null 2>&1 || true
-  helm repo update || die "Failed to update the NVIDIA Helm repository."
-  helm upgrade -i "${NVIDIA_DRA_DRIVER_RELEASE}" nvidia/nvidia-dra-driver-gpu \
-    --version "${NVIDIA_DRA_DRIVER_CHART_VERSION}" \
-    --namespace "${NVIDIA_DRA_DRIVER_NAMESPACE}" \
-    --create-namespace \
-    --set gpuResourcesEnabledOverride=true \
-    --set nvidiaDriverRoot="${NVIDIA_DRA_DRIVER_ROOT}" \
-    -f "${values_file}" ||
-    die "Failed to install the NVIDIA DRA driver Helm chart."
-  rm -f "${values_file}"
 }
 
-prescan_action "$@"
-initialize_defaults
-parse_args "$@"
-validate_args
-if [[ "${action}" == "repair_gpu_mounts" ]]; then
-  repair_gpu_mounts
-  exit 0
-fi
-check_deps
-linux_preflight
-container_cli="$(detect_container_cli)"
-gpu_preflight
-ensure_podman_kind_network
-ensure_registry
-create_cluster
-load_kind_nodes
-connect_registry_network
-configure_registry_for_nodes
-annotate_registry
-document_local_registry
-install_nvidia_dra_driver
+function readiness_timeout_seconds() {
+  [[ "${readiness_timeout}" =~ ^([1-9][0-9]*)(s|m|h)$ ]] ||
+    die "Readiness timeout must be a positive integer followed by s, m, or h."
+  local amount="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}"
+  case "${unit}" in
+    s) printf '%s\n' "${amount}" ;;
+    m) printf '%s\n' "$((amount * 60))" ;;
+    h) printf '%s\n' "$((amount * 3600))" ;;
+  esac
+}
 
-info "Cluster ${cluster_name} is ready."
+function verify_nvidia_ready() {
+  require_detected_gpu
+  local daemonset_name="${NVIDIA_DRA_DRIVER_RELEASE}-kubelet-plugin"
+  kubectl_cmd -n "${NVIDIA_DRA_DRIVER_NAMESPACE}" rollout status "daemonset/${daemonset_name}" \
+    --timeout="${readiness_timeout}" || die "NVIDIA DRA daemonset did not become ready. Check its pod logs and retry with --resume."
+  local scheduled
+  scheduled="$(kubectl_cmd --request-timeout=5s -n "${NVIDIA_DRA_DRIVER_NAMESPACE}" get daemonset "${daemonset_name}" \
+    -o jsonpath='{.status.desiredNumberScheduled}')" || die "Could not inspect NVIDIA DRA scheduling."
+  [[ "${scheduled}" =~ ^[1-9][0-9]*$ ]] || die "NVIDIA DRA is not scheduled on any GPU nodes. Check the node labels and chart selectors."
+  local timeout_seconds started devices
+  timeout_seconds="$(readiness_timeout_seconds)"
+  started="${SECONDS}"
+  while true; do
+    devices="$(kubectl_cmd --request-timeout=5s get resourceslices \
+      -o 'jsonpath={range .items[?(@.spec.driver=="gpu.nvidia.com")]}{range .spec.devices[*]}{.name}{"\n"}{end}{end}')" ||
+      die "Could not query NVIDIA ResourceSlices in the selected cluster."
+    [[ -z "${devices//[[:space:]]/}" ]] || return 0
+    ((SECONDS - started < timeout_seconds)) ||
+      die "NVIDIA DRA published no GPU devices within ${readiness_timeout}. Check driver logs and retry with --resume."
+    sleep 1
+  done
+}
+
+function verify_cluster_ready() {
+  kubectl_cmd wait --for=condition=Ready nodes --all --timeout="${readiness_timeout}" ||
+    die "Cluster nodes did not become Ready. Fix the reported error and retry with --resume."
+  if [[ "${gpu_enabled}" == true ]]; then
+    verify_nvidia_ready
+  fi
+}
+
+# Profiles are data, never shell programs. Values are literal, without quoting.
+function load_profile() {
+  local path="$1" line key value seen='|'
+  local env_version_set=false env_image_set=false
+  [[ -z "${MKCLUSTER_K8S_VERSION+x}" && -z "${MKCLUSTER_KUBERNETES_VERSION+x}" ]] || env_version_set=true
+  [[ -z "${MKCLUSTER_KIND_NODE_IMAGE+x}" ]] || env_image_set=true
+  [[ -f "${path}" ]] || die "Profile not found: ${path}"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -n "${line}" && "${line}" != \#* ]] || continue
+    [[ "${line}" == *=* && "${line}" != *$'\r'* ]] || die "Invalid profile line: ${line}"
+    key="${line%%=*}"; value="${line#*=}"
+    case "${key}" in
+      MKCLUSTER_NAME|MKCLUSTER_PROVIDER|MKCLUSTER_REGISTRY_NAME|MKCLUSTER_REGISTRY_PORT|MKCLUSTER_WORKER_COUNT|MKCLUSTER_IP_FAMILY|MKCLUSTER_K8S_VERSION|MKCLUSTER_KIND_VERSION|MKCLUSTER_KIND_NODE_IMAGE|MKCLUSTER_API_SERVER_ADDRESS|MKCLUSTER_API_SERVER_PORT|MKCLUSTER_HTTP_PORT|MKCLUSTER_HTTPS_PORT|MKCLUSTER_GPU|MKCLUSTER_GPU_DRA|MKCLUSTER_NVIDIA_DRA_DRIVER_CHART_VERSION|MKCLUSTER_NVIDIA_DRA_DRIVER_ROOT|MKCLUSTER_FEATURE_GATES|MKCLUSTER_WAIT|MKCLUSTER_KUBECONFIG) ;;
+      *) die "Unknown profile key: ${key}" ;;
+    esac
+    [[ "${seen}" != *"|${key}|"* ]] || die "Duplicate profile key: ${key}"
+    seen+="${key}|"
+    # Legacy environment names also outrank profile values.
+    case "${key}" in
+      MKCLUSTER_NAME) [[ -z "${KIND_CLUSTER_NAME+x}" ]] || continue ;;
+      MKCLUSTER_PROVIDER) [[ -z "${KIND_EXPERIMENTAL_PROVIDER+x}" ]] || continue ;;
+      MKCLUSTER_K8S_VERSION)
+        [[ -z "${MKCLUSTER_KUBERNETES_VERSION+x}" && "${env_image_set}" == false ]] || continue ;;
+      MKCLUSTER_KIND_NODE_IMAGE) [[ "${env_version_set}" == false ]] || continue ;;
+    esac
+    # Existing environment takes precedence, even when deliberately empty.
+    if ! declare -p "${key}" &>/dev/null; then
+      printf -v "${key}" '%s' "${value}"
+    fi
+  done <"${path}"
+}
+
+function set_option() {
+  local option="$1" value="$2"
+  require_arg "${option}" "${value}"
+  case "${option}" in
+    --profile) ;; # Loaded by prescan_action before defaults and other options.
+    --write-lock) lock_path="${value}" ;;
+    -n|--name) cluster_name="${value}" ;;
+    -i|--ip-family) ip_family="${value}" ;;
+    -P|--provider) provider="${value}" ;;
+    -a|--api-server-address) api_server_address="${value}" ;;
+    -p|--api-server-port) api_server_port="${value}" ;;
+    -W|--workers) worker_count="${value}" ;;
+    -w|--wait) readiness_timeout="${value}" ;;
+    -f|--feature-gate)
+      set_feature_gate "${value}"
+      cli_feature_gates+=("${value}") ;;
+    -k|--k8s-version)
+      kubernetes_version="${value}"
+      kubernetes_version_explicit=true
+      [[ "${node_image_explicit}" == true ]] || kind_node_image='' ;;
+    --kubeconfig)
+      if [[ "${kubeconfig_explicit}" == true && "${kubeconfig_path}" != "${value}" ]]; then
+        die "Conflicting kubeconfig paths."
+      fi
+      kubeconfig_path="${value}"
+      kubeconfig_explicit=true ;;
+    --node-image)
+      kind_node_image="${value}"
+      node_image_explicit=true
+      [[ "${kubernetes_version_explicit}" == true ]] || kubernetes_version=latest ;;
+    --http-port) http_port="${value}" ;;
+    --https-port) https_port="${value}" ;;
+    --registry-name) registry_name="${value}" ;;
+    --registry-port) registry_port="${value}" ;;
+    *) die "Unknown argument: ${option}. Pass through extra kind arguments after --" ;;
+  esac
+}
+
+function parse_kind_args() {
+  while (($#)); do
+    case "$1" in
+      --kubeconfig|--wait)
+        set_option "$1" "${2:-}"
+        shift 2 ;;
+      --kubeconfig=*|--wait=*)
+        set_option "${1%%=*}" "${1#*=}"
+        shift ;;
+      --name|--name=*|--config|--config=*|--image|--image=*|-n*|-h|--help|--)
+        die "Use mkcluster's options instead of forwarding $1; generated cluster identity/config must stay consistent." ;;
+      *) kind_extra_args+=("$1"); shift ;;
+    esac
+  done
+}
+
+function validate_port() {
+  validate_positive_int "$1" "$2"
+  if [[ ${#2} -gt 5 ]] || (( $2 > 65535 )); then
+    die "$1 must be between 1 and 65535."
+  fi
+}
+
+function emit_lock() {
+  local IFS=, gates
+  gates="${feature_gates[*]}"
+  printf '# mkcluster resolved profile; values are literal, not shell syntax.\n'
+  printf '%s\n' \
+    "MKCLUSTER_NAME=${cluster_name}" \
+    "MKCLUSTER_PROVIDER=${provider}" \
+    "MKCLUSTER_REGISTRY_NAME=${registry_name}" \
+    "MKCLUSTER_REGISTRY_PORT=${registry_port}" \
+    "MKCLUSTER_WORKER_COUNT=${worker_count}" \
+    "MKCLUSTER_IP_FAMILY=${ip_family}" \
+    "MKCLUSTER_K8S_VERSION=${kubernetes_version}" \
+    "MKCLUSTER_KIND_VERSION=${KIND_VERSION}" \
+    "MKCLUSTER_KIND_NODE_IMAGE=${kind_node_image}" \
+    "MKCLUSTER_API_SERVER_ADDRESS=${api_server_address}" \
+    "MKCLUSTER_API_SERVER_PORT=${api_server_port}" \
+    "MKCLUSTER_HTTP_PORT=${http_port}" \
+    "MKCLUSTER_HTTPS_PORT=${https_port}" \
+    "MKCLUSTER_GPU=${gpu_enabled}" \
+    "MKCLUSTER_GPU_DRA=${gpu_dra_enabled}" \
+    "MKCLUSTER_NVIDIA_DRA_DRIVER_CHART_VERSION=${NVIDIA_DRA_DRIVER_CHART_VERSION}" \
+    "MKCLUSTER_NVIDIA_DRA_DRIVER_ROOT=${NVIDIA_DRA_DRIVER_ROOT}" \
+    "MKCLUSTER_FEATURE_GATES=${gates}" \
+    "MKCLUSTER_WAIT=${readiness_timeout}" \
+    "MKCLUSTER_KUBECONFIG=${kubeconfig_path}"
+}
+
+function write_lock() {
+  [[ -n "${lock_path}" ]] || return 0
+  (( ${#kind_extra_args[@]} == 0 )) || die "Cannot lock arbitrary forwarded kind arguments; remove them before --write-lock."
+  [[ -n "${KIND_VERSION}" ]] || die "A lock requires the kind version. Install kind or set MKCLUSTER_KIND_VERSION explicitly."
+  [[ "${kind_node_image}" =~ @sha256:[a-fA-F0-9]{64}$ ]] || die "A lock requires a node image pinned with @sha256:<64 hex digits>."
+  local value temporary
+  for value in "${kubeconfig_path}" "${NVIDIA_DRA_DRIVER_ROOT}" "${kind_node_image}" "${KIND_VERSION}" "${NVIDIA_DRA_DRIVER_CHART_VERSION}"; do
+    [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || die "Cannot lock multiline values."
+  done
+  temporary="$(mktemp "${lock_path}.tmp.XXXXXX")" || die "Cannot write lock: ${lock_path}"
+  if ! emit_lock >"${temporary}" || ! mv -f -- "${temporary}" "${lock_path}"; then
+    rm -f -- "${temporary}"
+    die "Cannot write lock: ${lock_path}"
+  fi
+  info "Saved resolved profile: ${lock_path}" >&2
+}
+
+function report_failure() {
+  local status="$?"
+  if (( status != 0 )); then
+    warn "Stopped during ${stage}. Existing resources were preserved."
+    if [[ "${stage}" == provisioning || "${stage}" == configuration || "${stage}" == readiness ]]; then
+      warn "Inspect kind-${cluster_name}; rerun with the same settings and --resume if the cluster exists."
+    fi
+  fi
+}
+
+function main() {
+  prescan_action "$@"
+  initialize_defaults
+  parse_args "$@"
+  validate_args
+  [[ "${action}" == create || "${resume_enabled}" == false ]] || die "--resume can only be used for cluster setup."
+  [[ "${action}" != doctor || -z "${lock_path}" ]] || die "--doctor cannot write a lock."
+  trap report_failure EXIT
+  stage='GPU detection'
+  if [[ "${gpu_enabled}" == true || "${action}" == repair_gpu_mounts ]]; then
+    detect_gpu_hardware
+  fi
+  if [[ "${action}" == repair_gpu_mounts ]]; then
+    [[ -z "${lock_path}" ]] || die "GPU repair cannot write a lock."
+    stage='GPU repair'
+    repair_gpu_mounts
+    return
+  fi
+  stage='preflight'
+  if [[ "${action}" != dry-run ]]; then
+    check_deps
+    linux_preflight
+    container_cli="$(detect_container_cli)"
+    "${container_cli}" info >/dev/null || die "Selected container runtime is not reachable."
+  elif [[ "${gpu_enabled}" == true ]]; then
+    container_cli="$(detect_container_cli)"
+  fi
+  gpu_preflight
+  if [[ "${action}" == doctor ]]; then
+    info "Prerequisite checks passed for ${provider}; no resources changed."
+    return
+  fi
+  stage='version resolution'
+  detect_remote_defaults
+  write_lock
+  if [[ "${action}" == dry-run ]]; then
+    emit_kind_config
+    return
+  fi
+  stage='cluster inspection'
+  check_cluster_state
+  validate_resume_cluster
+  stage='provisioning'
+  ensure_podman_kind_network
+  ensure_registry
+  create_cluster
+  stage='configuration'
+  load_kind_nodes
+  connect_registry_network
+  configure_registry_for_nodes
+  annotate_registry
+  document_local_registry
+  install_nvidia_dra_driver
+  stage='readiness'
+  verify_cluster_ready
+  info "Cluster ${cluster_name} is ready."
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
